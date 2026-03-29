@@ -9,21 +9,19 @@ try:
     conn_url = st.secrets["connections"]["postgresql"]["url"]
     engine = create_engine(conn_url)
 except Exception:
-    st.error("Database connection string not found in Streamlit Secrets.")
+    st.error("Database connection string not found. Check your Streamlit Secrets.")
     st.stop()
 
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 
 # --- HELPER FUNCTIONS ---
 def load_data(uploaded_file, skiprows=0):
-    """Universal loader for CSV and Excel."""
     if uploaded_file.name.endswith('.csv'):
         return pd.read_csv(uploaded_file, skiprows=skiprows)
     else:
         return pd.read_excel(uploaded_file, skiprows=skiprows)
 
 def find_col(df, options):
-    """Helper to find columns even if names change slightly."""
     for opt in options:
         if opt in df.columns:
             return opt
@@ -33,10 +31,8 @@ def init_db():
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sku_mappings (
-                id SERIAL PRIMARY KEY,
-                channel TEXT NOT NULL,
-                channel_sku TEXT NOT NULL,
-                master_sku TEXT NOT NULL,
+                id SERIAL PRIMARY KEY, channel TEXT NOT NULL, 
+                channel_sku TEXT NOT NULL, master_sku TEXT NOT NULL,
                 UNIQUE(channel, channel_sku)
             );
         """))
@@ -56,7 +52,7 @@ def save_mapping_to_db(new_entries):
             """), entry)
         conn.commit()
 
-# --- CHANNEL PARSERS (CITY-LEVEL GRANULARITY) ---
+# --- CHANNEL PARSERS (FIXED ATTRIBUTE ERRORS) ---
 
 def parse_amazon(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -68,17 +64,18 @@ def parse_amazon(inv_df, sales_df=None):
     if 'Sell-Through %' in inv_df.columns:
         inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
     
+    # Initialize sales_val as a Series of zeros
+    sales_val = pd.Series(0, index=inv_df.index)
     if sales_df is not None:
         s_sku = find_col(sales_df, ['ASIN', 'asin'])
         if s_sku:
             sales_df[s_sku] = sales_df[s_sku].astype(str).str.strip()
             sales_grp = sales_df.groupby(s_sku)['Ordered Units'].sum()
             inv_df = inv_df.merge(sales_grp, left_on='channel_sku', right_index=True, how='left').fillna(0)
-            # Auto-calculate STR if missing or zero
+            sales_val = inv_df['Ordered Units']
             inv_df['str'] = inv_df.apply(lambda x: x['Ordered Units'] / (x['Ordered Units'] + x['inventory']) if (x['Ordered Units'] + x['inventory']) > 0 and x['str'] == 0 else x['str'], axis=1)
-            inv_df['doc'] = inv_df['inventory'] / (inv_df['Ordered Units'] / 30).replace(0, 0.001)
-    else:
-        inv_df['doc'] = 0
+    
+    inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_blinkit(inv_df, sales_df=None):
@@ -89,6 +86,7 @@ def parse_blinkit(inv_df, sales_df=None):
     inv_df['location'] = inv_df['fac_id']
     inv_df['inventory'] = pd.to_numeric(inv_df['Total sellable'], errors='coerce').fillna(0)
     
+    sales_val = pd.Series(0, index=inv_df.index)
     if sales_df is not None:
         s_sku = find_col(sales_df, ['Item Id', 'item_id'])
         s_fac = find_col(sales_df, ['Facility Name', 'Store', 'Warehouse'])
@@ -98,7 +96,6 @@ def parse_blinkit(inv_df, sales_df=None):
             sales_grp = sales_df.groupby([s_sku, 'fac_id'])['Quantity'].sum().reset_index()
             inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', 'fac_id'], right_on=[s_sku, 'fac_id'], how='left').fillna(0)
             sales_val = inv_df['Quantity']
-        else: sales_val = 0
     else:
         sales_val = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0)
     
@@ -106,26 +103,25 @@ def parse_blinkit(inv_df, sales_df=None):
     inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
-def parse_swiggy(inv_df, sales_df):
+def parse_swiggy(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
     inv_df['fac_id'] = inv_df['FacilityName'].astype(str).str.strip()
     inv_df['location'] = inv_df['City'] + " (" + inv_df['FacilityName'] + ")"
-    
-    s_sku = find_col(sales_df, ['ITEM_CODE', 'ItemCode', 'SKU'])
-    s_fac = find_col(sales_df, ['FACILITY_NAME', 'FacilityName', 'Store'])
-    
-    if s_sku and s_fac:
-        sales_df = sales_df.copy()
-        sales_df['c_sku'] = sales_df[s_sku].astype(str).str.strip()
-        sales_df['c_fac'] = sales_df[s_fac].astype(str).str.strip()
-        sales_grp = sales_df.groupby(['c_sku', 'c_fac'])['UNITS_SOLD'].sum().reset_index()
-        inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', 'fac_id'], right_on=['c_sku', 'c_fac'], how='left').fillna(0)
-        sales_val = inv_df['UNITS_SOLD']
-    else:
-        sales_val = 0
-
     inv_df['inventory'] = pd.to_numeric(inv_df['WarehouseQtyAvailable'], errors='coerce').fillna(0)
+    
+    sales_val = pd.Series(0, index=inv_df.index)
+    if sales_df is not None:
+        s_sku = find_col(sales_df, ['ITEM_CODE', 'ItemCode', 'SKU'])
+        s_fac = find_col(sales_df, ['FACILITY_NAME', 'FacilityName', 'Store'])
+        if s_sku and s_fac:
+            sales_df = sales_df.copy()
+            sales_df['c_sku'] = sales_df[s_sku].astype(str).str.strip()
+            sales_df['c_fac'] = sales_df[s_fac].astype(str).str.strip()
+            sales_grp = sales_df.groupby(['c_sku', 'c_fac'])['UNITS_SOLD'].sum().reset_index()
+            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', 'fac_id'], right_on=['c_sku', 'c_fac'], how='left').fillna(0)
+            sales_val = inv_df['UNITS_SOLD']
+
     inv_df['str'] = sales_val / (sales_val + inv_df['inventory']).replace(0, 1)
     inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
@@ -136,10 +132,11 @@ def parse_bigbasket(inv_df, sales_df=None):
     inv_df['location'] = inv_df['DC'].astype(str).str.strip() if 'DC' in inv_df.columns else "Unknown"
     inv_df['inventory'] = pd.to_numeric(inv_df['Total SOH'], errors='coerce').fillna(0)
     
-    sales_val = 0
+    sales_val = pd.Series(0, index=inv_df.index)
     if sales_df is not None:
-        s_sku = find_col(sales_df, ['source_sku_id', 'SKU_Id'])
+        s_sku = find_col(sales_df, ['source_sku_id', 'SKU_Id', 'SKU ID'])
         if s_sku:
+            sales_df[s_sku] = sales_df[s_sku].astype(str).str.strip()
             sales_grp = sales_df.groupby(s_sku)['total_quantity'].sum()
             inv_df = inv_df.merge(sales_grp, left_on='channel_sku', right_index=True, how='left').fillna(0)
             sales_val = inv_df['total_quantity']
@@ -153,34 +150,39 @@ init_db()
 master_list = pd.read_csv(COMMON_SKU_FILE)['name'].unique().tolist()
 db_mappings = load_mapping_from_db()
 
-st.title("🛡️ Mama Nourish | Inventory Control Center")
+st.title("🛡️ Mama Nourish | Inventory Control Hub")
 
-# --- 1. UPLOAD ---
+# --- 1. UPLOAD (CLEAR SEPARATION) ---
+st.subheader("📥 Upload Reports")
 c1, c2, c3, c4 = st.columns(4)
 uploaded_data = []
 f_types = ["csv", "xlsx", "xls"]
 
 with c1:
     st.info("**Amazon**")
-    ai, as_ = st.file_uploader("Amazon Inv", type=f_types), st.file_uploader("Amazon Sales", type=f_types)
+    ai = st.file_uploader("Amazon Inventory", type=f_types, key="amz_i")
+    as_ = st.file_uploader("Amazon Sales", type=f_types, key="amz_s")
     if ai: uploaded_data.append((parse_amazon(load_data(ai, 1), load_data(as_, 1) if as_ else None), 'Amazon'))
 
 with c2:
     st.info("**Blinkit**")
-    bi, bs = st.file_uploader("Blinkit Inv", type=f_types), st.file_uploader("Blinkit Sales", type=f_types)
+    bi = st.file_uploader("Blinkit Inventory", type=f_types, key="blk_i")
+    bs = st.file_uploader("Blinkit Sales", type=f_types, key="blk_s")
     if bi: uploaded_data.append((parse_blinkit(load_data(bi, 2), load_data(bs) if bs else None), 'Blinkit'))
 
 with c3:
     st.info("**Swiggy**")
-    si, ss = st.file_uploader("Swiggy Inv", type=f_types), st.file_uploader("Swiggy Sales", type=f_types)
-    if si and ss: uploaded_data.append((parse_swiggy(load_data(si), load_data(ss)), 'Swiggy'))
+    si = st.file_uploader("Swiggy Inventory", type=f_types, key="swg_i")
+    ss = st.file_uploader("Swiggy Sales", type=f_types, key="swg_s")
+    if si: uploaded_data.append((parse_swiggy(load_data(si), load_data(ss) if ss else None), 'Swiggy'))
 
 with c4:
     st.info("**Big Basket**")
-    bbi, bbs = st.file_uploader("BB Inv", type=f_types), st.file_uploader("BB Sales", type=f_types)
+    bbi = st.file_uploader("BB Inventory", type=f_types, key="bb_i")
+    bbs = st.file_uploader("BB Sales", type=f_types, key="bb_s")
     if bbi: uploaded_data.append((parse_bigbasket(load_data(bbi), load_data(bbs) if bbs else None), 'Big Basket'))
 
-# --- 2. PROCESSING ---
+# --- 2. DATA MERGING & MAPPING ---
 if uploaded_data:
     all_dfs = []
     for df, channel in uploaded_data:
@@ -194,47 +196,40 @@ if uploaded_data:
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
-        st.warning(f"🚨 {len(unmapped)} New SKUs found. Please map them.")
+        st.warning(f"🚨 {len(unmapped)} New SKUs found. Map them to continue.")
         with st.form("map_form"):
             new_entries = []
             for _, row in unmapped.iterrows():
                 choice = st.selectbox(f"{row['channel']}: {row['channel_sku']}", ["Select..."] + master_list)
-                if choice != "Select...": new_entries.append({"channel": row['channel'], "channel_sku": row['channel_sku'], "master_sku": choice})
-            if st.form_submit_button("Sync Mappings"):
+                if choice != "Select...": 
+                    new_entries.append({"channel": row['channel'], "channel_sku": row['channel_sku'], "master_sku": choice})
+            if st.form_submit_button("Save & Sync"):
                 save_mapping_to_db(new_entries)
                 st.rerun()
     else:
-        # --- 3. SIDEBAR FILTERS (RESTORED) ---
+        # --- 3. SIDEBAR FILTERS ---
         st.sidebar.header("🔍 Global Filters")
-        
-        # Channel Filter
         u_channels = sorted(merged['channel'].unique().tolist())
-        sel_channels = st.sidebar.multiselect("Filter by Channel (Customer)", u_channels, default=u_channels)
+        sel_channels = st.sidebar.multiselect("Filter by Channel", u_channels, default=u_channels)
         
-        # Product Filter
         u_products = sorted(merged['master_sku'].dropna().unique().tolist())
         sel_products = st.sidebar.multiselect("Filter by Product", u_products, default=u_products)
 
-        # Apply Filtering Logic
-        filtered_df = merged[
-            (merged['channel'].isin(sel_channels)) & 
-            (merged['master_sku'].isin(sel_products))
-        ]
+        filtered_df = merged[(merged['channel'].isin(sel_channels)) & (merged['master_sku'].isin(sel_products))]
 
         # --- 4. TOP LINE METRICS ---
         st.divider()
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
         
-        doc_avg = filtered_df[filtered_df['doc'] > 0]['doc'].mean()
-        m2.metric("Avg Days of Cover", f"{doc_avg:.1f} days" if not pd.isna(doc_avg) else "0 days")
+        valid_doc = filtered_df[filtered_df['doc'] > 0]['doc']
+        m2.metric("Avg Days of Cover", f"{valid_doc.mean():.1f} days" if not valid_doc.empty else "0 days")
         
-        str_avg = filtered_df[filtered_df['str'] > 0]['str'].mean()
-        m3.metric("Avg Sell-Through %", f"{str_avg:.2%}" if not pd.isna(str_avg) else "0.00%")
+        valid_str = filtered_df[filtered_df['str'] > 0]['str']
+        m3.metric("Avg Sell-Through %", f"{valid_str.mean():.2%}" if not valid_str.empty else "0.00%")
 
-        # --- 5. DATA TABLE ---
+        # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
-        
         def color_doc(val):
             color = 'red' if val < 7 else 'orange' if val < 15 else 'white'
             return f'color: {color}'
@@ -242,11 +237,9 @@ if uploaded_data:
         display_cols = ['master_sku', 'channel', 'location', 'inventory', 'doc', 'str']
         st.dataframe(
             filtered_df[display_cols].sort_values('doc').style.format({
-                'str': '{:.2%}', 
-                'doc': '{:.1f}', 
-                'inventory': '{:,.0f}'
+                'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}'
             }).applymap(color_doc, subset=['doc']),
             use_container_width=True
         )
 else:
-    st.info("Please upload channel files to view the dashboard.")
+    st.info("Upload channel files to generate the dashboard.")
