@@ -364,6 +364,11 @@ if uploaded_data:
         # Exclude zero-inventory rows — they have no meaningful DOC/STR and skew metrics
         filtered_df = filtered_df[filtered_df['inventory'] > 0].copy()
 
+        # Location filter — only show locations that have active (non-zero) inventory
+        u_locations = sorted(filtered_df['location'].dropna().unique().tolist())
+        sel_locations = st.sidebar.multiselect("Filter by Location", u_locations, default=u_locations)
+        filtered_df = filtered_df[filtered_df['location'].isin(sel_locations)]
+
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
         m1, m2, m3 = st.columns(3)
