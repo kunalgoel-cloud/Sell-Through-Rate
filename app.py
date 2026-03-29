@@ -398,88 +398,104 @@ if uploaded_data:
         sel_locations = st.sidebar.multiselect("Filter by Location", u_locations, default=u_locations)
         filtered_df = filtered_df[filtered_df['location'].isin(sel_locations)]
 
-        # --- ACTIONABLE FILTERS (Table-level only, do not affect top-line metrics) ---
+        # --- ACTIONABLE FILTERS (Drive both metrics and table) ---
         st.sidebar.divider()
         st.sidebar.header("🎯 Actionable Filters")
-        st.sidebar.caption("Filter the output table to focus on SKUs that need attention.")
+        st.sidebar.caption("Metrics and table both update based on these thresholds.")
 
-        min_doc = st.sidebar.slider(
-            "Min Days of Cover (DOC)",
-            min_value=0, max_value=180, value=0, step=1,
-            help="Show only rows where Days of Cover is ≥ this value"
+        doc_range = st.sidebar.slider(
+            "Days of Cover (DOC) range",
+            min_value=0, max_value=500, value=(0, 500), step=1,
+            help="Show only rows where Days of Cover falls within this range"
         )
-        max_doc = st.sidebar.slider(
-            "Max Days of Cover (DOC)",
-            min_value=0, max_value=500, value=500, step=1,
-            help="Show only rows where Days of Cover is ≤ this value"
+        min_doc, max_doc = doc_range
+
+        str_range = st.sidebar.slider(
+            "Sell-Through Rate (STR) range %",
+            min_value=0, max_value=100, value=(0, 100), step=1,
+            help="Show only rows where Sell-Through Rate falls within this range"
         )
-        min_str = st.sidebar.slider(
-            "Min Sell-Through Rate (%)",
-            min_value=0, max_value=100, value=0, step=1,
-            help="Show only rows where Sell-Through Rate is ≥ this value"
-        )
+        min_str, max_str = str_range
+
+        # --- Apply actionable filters early so metrics reflect them too ---
+        action_active = (min_doc > 0 or max_doc < 500 or min_str > 0 or max_str < 100)
+        table_df = filtered_df[
+            (filtered_df['doc'] >= min_doc) &
+            (filtered_df['doc'] <= max_doc) &
+            (filtered_df['str'] >= min_str / 100) &
+            (filtered_df['str'] <= max_str / 100)
+        ].copy()
+
+        # Metrics always reflect the actionable-filtered view
+        metrics_df = table_df
+
+        # Build a dynamic label suffix for metric headers
+        doc_label = f" | DOC {min_doc}–{max_doc}d" if (min_doc > 0 or max_doc < 500) else ""
+        str_label = f" | STR {min_str}–{max_str}%" if (min_str > 0 or max_str < 100) else ""
+        filter_label = doc_label + str_label
 
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
+        m1.metric(f"Total Inventory{filter_label}", f"{metrics_df['inventory'].sum():,.0f} units")
 
         # Weighted avg DOC: also exclude sentinel-inflated rows (no sales data, doc > 9999)
-        valid_doc_data = filtered_df[(filtered_df['doc'] > 0) & (filtered_df['doc'] < 9999)]
+        valid_doc_data = metrics_df[(metrics_df['doc'] > 0) & (metrics_df['doc'] < 9999)]
         if not valid_doc_data.empty and valid_doc_data['inventory'].sum() > 0:
             weighted_doc = (valid_doc_data['doc'] * valid_doc_data['inventory']).sum() / valid_doc_data['inventory'].sum()
-            m2.metric("Avg Days of Cover", f"{weighted_doc:.1f} days")
+            m2.metric(f"Avg Days of Cover{filter_label}", f"{weighted_doc:.1f} days")
         else:
-            m2.metric("Avg Days of Cover", "N/A")
+            m2.metric(f"Avg Days of Cover{filter_label}", "N/A")
 
         # Weighted avg STR across all rows with inventory (already filtered above)
-        if not filtered_df.empty:
-            weighted_str = (filtered_df['str'] * filtered_df['inventory']).sum() / filtered_df['inventory'].sum()
-            m3.metric("Avg Sell-Through %", f"{weighted_str:.2%}")
+        if not metrics_df.empty:
+            weighted_str = (metrics_df['str'] * metrics_df['inventory']).sum() / metrics_df['inventory'].sum()
+            m3.metric(f"Avg Sell-Through %{filter_label}", f"{weighted_str:.2%}")
         else:
-            m3.metric("Avg Sell-Through %", "0.00%")
+            m3.metric(f"Avg Sell-Through %{filter_label}", "0.00%")
 
         # Avg DRR = total units sold across period / n_days
         # Each channel may have a different n_days, so compute per-channel then sum
-        if not filtered_df.empty and filtered_df['units_sold'].sum() > 0:
+        if not metrics_df.empty and metrics_df['units_sold'].sum() > 0:
             total_units = 0
             total_days = 0
-            for ch, grp in filtered_df.groupby('channel'):
+            for ch, grp in metrics_df.groupby('channel'):
                 ch_units = grp['units_sold'].sum()
-                ch_days = grp['n_days'].max()  # same n_days for all rows in a channel
+                ch_days = grp['n_days'].max()
                 if ch_days > 0:
                     total_units += ch_units
-                    total_days = max(total_days, ch_days)  # use longest period as denominator
+                    total_days = max(total_days, ch_days)
             avg_drr = total_units / total_days if total_days > 0 else 0
-            m4.metric("Avg DRR", f"{avg_drr:.2f} units/day")
+            m4.metric(f"Avg DRR{filter_label}", f"{avg_drr:.2f} units/day")
         else:
-            m4.metric("Avg DRR", "N/A")
+            m4.metric(f"Avg DRR{filter_label}", "N/A")
 
         # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
 
-        # Apply actionable filters (DOC range + min STR) — table only, metrics unaffected
-        table_df = filtered_df.copy()
-        table_df = table_df[
-            (table_df['doc'] >= min_doc) &
-            (table_df['doc'] <= max_doc) &
-            (table_df['str'] >= min_str / 100)
-        ]
-
-        # Show filter summary
+        # Filter summary caption
         total_rows = len(filtered_df)
         shown_rows = len(table_df)
-        if min_doc > 0 or max_doc < 500 or min_str > 0:
+        if action_active:
             filter_parts = []
             if min_doc > 0 or max_doc < 500:
-                filter_parts.append(f"DOC between **{min_doc}** – **{max_doc}** days")
-            if min_str > 0:
-                filter_parts.append(f"STR ≥ **{min_str}%**")
+                filter_parts.append(f"DOC **{min_doc}–{max_doc}** days")
+            if min_str > 0 or max_str < 100:
+                filter_parts.append(f"STR **{min_str}–{max_str}%**")
             st.caption(
                 f"🎯 Showing **{shown_rows}** of {total_rows} rows — filtered by {', '.join(filter_parts)}"
             )
         else:
             st.caption(f"Showing all **{total_rows}** rows. Use the Actionable Filters in the sidebar to narrow down.")
+
+        # --- Group-by radio ---
+        group_by = st.radio(
+            "Group by:",
+            options=["None", "Channel", "Product", "Location"],
+            horizontal=True,
+            index=0,
+            help="Aggregate the table rows by the selected dimension"
+        )
 
         def color_doc(val):
             if val < 7:
@@ -487,14 +503,61 @@ if uploaded_data:
             elif val < 15:
                 return 'color: orange; font-weight: bold'
             else:
-                return ''  # inherit default — 'white' was invisible on white background
+                return ''
 
         display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
-        st.dataframe(
-            table_df[display_cols].sort_values('doc').style.format({
-                'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
-            }).applymap(color_doc, subset=['doc']),
-            use_container_width=True
-        )
+
+        if group_by == "None":
+            render_df = table_df[display_cols].sort_values('inventory', ascending=False)
+            st.dataframe(
+                render_df.style.format({
+                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
+                }).applymap(color_doc, subset=['doc']),
+                use_container_width=True
+            )
+        else:
+            # Build aggregation by the chosen dimension
+            group_col_map = {"Channel": "channel", "Product": "master_sku", "Location": "location"}
+            grp_col = group_col_map[group_by]
+
+            agg_df = table_df.groupby(grp_col).agg(
+                inventory=('inventory', 'sum'),
+                units_sold=('units_sold', 'sum'),
+            ).reset_index()
+
+            # Weighted avg DOC per group (inventory-weighted, exclude sentinel rows)
+            def weighted_doc(grp):
+                valid = grp[(grp['doc'] > 0) & (grp['doc'] < 9999)]
+                if valid.empty or valid['inventory'].sum() == 0:
+                    return float('nan')
+                return (valid['doc'] * valid['inventory']).sum() / valid['inventory'].sum()
+
+            def weighted_str(grp):
+                if grp['inventory'].sum() == 0:
+                    return 0.0
+                return (grp['str'] * grp['inventory']).sum() / grp['inventory'].sum()
+
+            def group_drr(grp):
+                total_u = 0; total_d = 0
+                for ch, sub in grp.groupby('channel'):
+                    total_u += sub['units_sold'].sum()
+                    total_d = max(total_d, sub['n_days'].max())
+                return total_u / total_d if total_d > 0 else 0.0
+
+            doc_series = table_df.groupby(grp_col).apply(weighted_doc).rename('doc')
+            str_series = table_df.groupby(grp_col).apply(weighted_str).rename('str')
+            drr_series = table_df.groupby(grp_col).apply(group_drr).rename('drr')
+
+            agg_df = agg_df.join(doc_series, on=grp_col)
+            agg_df = agg_df.join(str_series, on=grp_col)
+            agg_df = agg_df.join(drr_series, on=grp_col)
+            agg_df = agg_df.sort_values('inventory', ascending=False).reset_index(drop=True)
+
+            st.dataframe(
+                agg_df.style.format({
+                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
+                }).applymap(color_doc, subset=['doc']),
+                use_container_width=True
+            )
 else:
     st.info("Upload channel files to generate the dashboard.")
