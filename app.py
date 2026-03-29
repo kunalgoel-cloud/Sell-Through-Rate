@@ -217,16 +217,26 @@ if uploaded_data:
 
         filtered_df = merged[(merged['channel'].isin(sel_channels)) & (merged['master_sku'].isin(sel_products))]
 
-        # --- 4. TOP LINE METRICS ---
+        # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
         
-        valid_doc = filtered_df[filtered_df['doc'] > 0]['doc']
-        m2.metric("Avg Days of Cover", f"{valid_doc.mean():.1f} days" if not valid_doc.empty else "0 days")
+        # FIXED: Weighted average DOC calculation based on city-level inventory
+        valid_doc_data = filtered_df[filtered_df['doc'] > 0]
+        if not valid_doc_data.empty:
+            weighted_doc = (valid_doc_data['doc'] * valid_doc_data['inventory']).sum() / valid_doc_data['inventory'].sum()
+            m2.metric("Avg Days of Cover", f"{weighted_doc:.1f} days")
+        else:
+            m2.metric("Avg Days of Cover", "0 days")
         
-        valid_str = filtered_df[filtered_df['str'] > 0]['str']
-        m3.metric("Avg Sell-Through %", f"{valid_str.mean():.2%}" if not valid_str.empty else "0.00%")
+        # FIXED: Weighted average STR% calculation based on city-level inventory
+        valid_str_data = filtered_df[filtered_df['str'] > 0]
+        if not valid_str_data.empty:
+            weighted_str = (valid_str_data['str'] * valid_str_data['inventory']).sum() / valid_str_data['inventory'].sum()
+            m3.metric("Avg Sell-Through %", f"{weighted_str:.2%}")
+        else:
+            m3.metric("Avg Sell-Through %", "0.00%")
 
         # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
