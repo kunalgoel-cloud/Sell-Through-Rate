@@ -511,7 +511,7 @@ if uploaded_data:
             render_df = table_df[display_cols].sort_values('inventory', ascending=False)
             st.dataframe(
                 render_df.style.format({
-                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
+                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}', 'units_sold': '{:,.1f}'
                 }).applymap(color_doc, subset=['doc']),
                 use_container_width=True
             )
@@ -555,7 +555,7 @@ if uploaded_data:
 
             st.dataframe(
                 agg_df.style.format({
-                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
+                    'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}', 'units_sold': '{:,.1f}'
                 }).applymap(color_doc, subset=['doc']),
                 use_container_width=True
             )
