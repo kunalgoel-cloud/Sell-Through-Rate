@@ -1,23 +1,21 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-import io
+import os
 
 # --- DATABASE & CONFIG ---
-st.set_page_config(page_title="Mama Nourish | Global Inventory Hub", layout="wide")
+st.set_page_config(page_title="Mama Nourish | Inventory Control", layout="wide")
 
-# Database Connection
 try:
     conn_url = st.secrets["connections"]["postgresql"]["url"]
     engine = create_engine(conn_url)
-except Exception as e:
-    st.error("Database connection string not found in secrets.")
+except Exception:
+    st.error("Database connection string not found. Please add it to Streamlit Secrets.")
     st.stop()
 
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 
 # --- DB FUNCTIONS ---
-
 def init_db():
     with engine.connect() as conn:
         conn.execute(text("""
@@ -38,30 +36,21 @@ def load_mapping_from_db():
 def save_mapping_to_db(new_entries):
     with engine.connect() as conn:
         for entry in new_entries:
-            conn.execute(
-                text("""
-                    INSERT INTO sku_mappings (channel, channel_sku, master_sku)
-                    VALUES (:channel, :channel_sku, :master_sku)
-                    ON CONFLICT (channel, channel_sku) 
-                    DO UPDATE SET master_sku = EXCLUDED.master_sku
-                """),
-                entry
-            )
+            conn.execute(text("""
+                INSERT INTO sku_mappings (channel, channel_sku, master_sku)
+                VALUES (:channel, :channel_sku, :master_sku)
+                ON CONFLICT (channel, channel_sku) DO UPDATE SET master_sku = EXCLUDED.master_sku
+            """), entry)
         conn.commit()
 
 # --- CHANNEL PARSERS ---
-
 def parse_amazon(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['ASIN'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Sellable On Hand Units'], errors='coerce').fillna(0)
-    # Convert '113.98%' style string or decimal to float
     inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
-    
     if sales_df is not None:
         sales_df['ASIN'] = sales_df['ASIN'].astype(str).str.strip()
-        # Calculate DRR (Daily Run Rate). Default to 30 days or 1 if daily report.
-        # We divide by 30 to maintain a standard monthly-based cover estimate.
         drr = sales_df.groupby('ASIN')['Ordered Units'].sum() / 30
         inv_df = inv_df.merge(drr, left_on='ASIN', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['Ordered Units'].replace(0, 0.001)
@@ -107,22 +96,21 @@ def parse_bigbasket(inv_df, sales_df=None):
     return inv_df[['channel_sku', 'inventory', 'doc']]
 
 # --- MAIN APP ---
-
 init_db()
 master_list = pd.read_csv(COMMON_SKU_FILE)['name'].unique().tolist()
 db_mappings = load_mapping_from_db()
 
-st.title("🛡️ Mama Nourish | Cross-Channel Control")
+st.title("🛡️ Mama Nourish | Inventory Control Center")
 
-# 1. UPLOAD SECTION
-st.subheader("📥 Step 1: Upload Reports")
+# --- STEP 1: UPLOAD ---
+st.subheader("📥 Upload Reports")
 c1, c2, c3, c4 = st.columns(4)
 uploaded_data = []
 
 with c1:
     st.info("**Amazon**")
     amz_i = st.file_uploader("Amazon Inventory", type="csv")
-    amz_s = st.file_uploader("Amazon Sales (Custom/MTD)", type="csv")
+    amz_s = st.file_uploader("Amazon Sales (Custom)", type="csv")
     if amz_i:
         s_df = pd.read_csv(amz_s, skiprows=1) if amz_s else None
         uploaded_data.append((parse_amazon(pd.read_csv(amz_i, skiprows=1), s_df), 'Amazon'))
@@ -144,25 +132,26 @@ with c3:
 
 with c4:
     st.info("**Big Basket**")
-    bb_i = st.file_uploader("Big Basket Inventory", type="csv")
-    bb_s = st.file_uploader("Big Basket Sales", type="csv")
+    bb_i = st.file_uploader("BB Inventory", type="csv")
+    bb_s = st.file_uploader("BB Sales", type="csv")
     if bb_i:
         s_df = pd.read_csv(bb_s) if bb_s else None
         uploaded_data.append((parse_bigbasket(pd.read_csv(bb_i), s_df), 'Big Basket'))
 
-# 2. PROCESSING
+# --- STEP 2: PROCESSING & FILTERS ---
 if uploaded_data:
-    raw_dfs = []
+    all_dfs = []
     for df, channel in uploaded_data:
         df['channel'] = channel
-        raw_dfs.append(df)
+        all_dfs.append(df)
     
-    combined_raw = pd.concat(raw_dfs, ignore_index=True)
-    merged = combined_raw.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
+    combined = pd.concat(all_dfs, ignore_index=True)
+    merged = combined.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
+    
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
-        st.warning(f"🚨 {len(unmapped)} New SKUs found.")
+        st.warning(f"🚨 {len(unmapped)} New SKUs found. Link them once to save to Neon DB.")
         with st.form("mapping_form"):
             new_db_entries = []
             for _, row in unmapped.iterrows():
@@ -170,19 +159,38 @@ if uploaded_data:
                 choice = st.selectbox(f"Map {chan}: {c_sku}", ["Select..."] + master_list, key=f"{chan}_{c_sku}")
                 if choice != "Select...":
                     new_db_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
-            if st.form_submit_button("Save to Neon Cloud"):
+            if st.form_submit_button("Permanent Save to Neon"):
                 if new_db_entries:
                     save_mapping_to_db(new_db_entries)
+                    st.success("Cloud Updated!")
                     st.rerun()
     else:
-        # 3. FINAL DASHBOARD
-        st.divider()
-        st.subheader("📊 Consolidated Inventory & Sales Health")
+        # --- SIDEBAR FILTERS ---
+        st.sidebar.header("🔍 Filter View")
         
-        for col in ['doc', 'str']:
-            if col not in merged.columns: merged[col] = 0
+        # Channel Filter
+        channels = ["All"] + sorted(merged['channel'].unique().tolist())
+        sel_channel = st.sidebar.selectbox("Select Channel", channels)
+        
+        # Product Filter
+        products = ["All"] + sorted(merged['master_sku'].unique().tolist())
+        sel_product = st.sidebar.selectbox("Select Product (Master SKU)", products)
 
-        # High-Risk Highlights & Percentage Formatting
+        # Apply Filtering Logic
+        filtered_df = merged.copy()
+        if sel_channel != "All":
+            filtered_df = filtered_df[filtered_df['channel'] == sel_channel]
+        if sel_product != "All":
+            filtered_df = filtered_df[filtered_df['master_sku'] == sel_product]
+
+        # --- STEP 3: FINAL DASHBOARD ---
+        st.divider()
+        st.subheader("📊 Consolidated Inventory Health")
+        
+        # Ensure consistent columns
+        for col in ['doc', 'str']:
+            if col not in filtered_df.columns: filtered_df[col] = 0
+
         def style_metrics(df):
             return df.style.format({
                 'str': '{:.2%}',
@@ -190,7 +198,9 @@ if uploaded_data:
                 'doc': '{:.1f} days'
             }).background_gradient(subset=['doc'], cmap='RdYlGn_r')
 
-        display_df = merged[['master_sku', 'channel', 'inventory', 'doc', 'str']].sort_values('doc')
-        st.dataframe(style_metrics(display_df), use_container_width=True)
+        display_cols = ['master_sku', 'channel', 'inventory', 'doc', 'str']
+        final_view = filtered_df[display_cols].sort_values('doc')
+        
+        st.dataframe(style_metrics(final_view), use_container_width=True)
 else:
-    st.info("Upload channel files to generate report.")
+    st.info("Please upload channel files to view the dashboard.")
