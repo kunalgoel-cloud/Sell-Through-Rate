@@ -109,21 +109,35 @@ def parse_swiggy(inv_df, sales_df=None):
     inv_df['fac_id'] = inv_df['FacilityName'].astype(str).str.strip()
     inv_df['location'] = inv_df['City'] + " (" + inv_df['FacilityName'] + ")"
     inv_df['inventory'] = pd.to_numeric(inv_df['WarehouseQtyAvailable'], errors='coerce').fillna(0)
-    
-    sales_val = pd.Series(0, index=inv_df.index)
+    # Normalise city for joining (sales file has CITY, not FacilityName)
+    inv_df['_city_key'] = inv_df['City'].astype(str).str.strip().str.upper()
+
+    sales_val = pd.Series(0.0, index=inv_df.index)
+    n_days = 30  # default; overridden below when a date column is present
     if sales_df is not None:
+        sales_df = sales_df.copy()
         s_sku = find_col(sales_df, ['ITEM_CODE', 'ItemCode', 'SKU'])
-        s_fac = find_col(sales_df, ['FACILITY_NAME', 'FacilityName', 'Store'])
-        if s_sku and s_fac:
-            sales_df = sales_df.copy()
+        # Sales report uses CITY, not FacilityName — join on SKU + City
+        s_city = find_col(sales_df, ['CITY', 'City', 'city'])
+        # Detect actual date span so DOC & STR are correctly normalised to 30 days
+        date_col = find_col(sales_df, ['ORDERED_DATE', 'OrderedDate', 'Date', 'date'])
+        if date_col:
+            dates = pd.to_datetime(sales_df[date_col], errors='coerce').dropna()
+            if not dates.empty:
+                n_days = max((dates.max() - dates.min()).days + 1, 1)
+        if s_sku and s_city:
             sales_df['c_sku'] = sales_df[s_sku].astype(str).str.strip()
-            sales_df['c_fac'] = sales_df[s_fac].astype(str).str.strip()
-            sales_grp = sales_df.groupby(['c_sku', 'c_fac'])['UNITS_SOLD'].sum().reset_index()
-            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', 'fac_id'], right_on=['c_sku', 'c_fac'], how='left').fillna(0)
+            sales_df['c_city'] = sales_df[s_city].astype(str).str.strip().str.upper()
+            sales_grp = sales_df.groupby(['c_sku', 'c_city'])['UNITS_SOLD'].sum().reset_index()
+            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', '_city_key'],
+                                  right_on=['c_sku', 'c_city'], how='left').fillna(0)
             sales_val = inv_df['UNITS_SOLD']
 
-    inv_df['str'] = sales_val / (sales_val + inv_df['inventory']).replace(0, 1)
-    inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
+    # Normalise raw sales to a 30-day equivalent for STR, keep daily rate for DOC
+    daily_rate = (sales_val / n_days).replace(0, 0.001)
+    sales_30d = sales_val * (30 / n_days)
+    inv_df['str'] = sales_30d / (sales_30d + inv_df['inventory']).replace(0, 1)
+    inv_df['doc'] = inv_df['inventory'] / daily_rate
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
