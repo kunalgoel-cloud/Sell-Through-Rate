@@ -152,6 +152,7 @@ def parse_blinkit(inv_df, sales_df=None):
         fallback_doc = inv_df['inventory'] / (last30 / 30).replace(0, 0.001)
         inv_df['doc'] = computed_doc.where(sales_val > 0, fallback_doc)
         # DRR: from sales where available, back-computed from fallback doc otherwise
+        # Only back-compute when last30 > 0 — last30=0 means no data, so DRR is unknown (0)
         fallback_drr = (last30 / 30).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
@@ -210,13 +211,14 @@ def parse_swiggy(inv_df, sales_df=None):
         computed_doc = inv_df['inventory'] / daily_rate
         inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
         # DRR: from sales where available, back-computed from DaysOnHand fallback otherwise
-        fallback_drr = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        # Only back-compute when doh > 0 — doh=0 means no data, so DRR is unknown (0)
+        fallback_drr = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
         # No sales file: use Swiggy's own DaysOnHand as DOC, STR unavailable
         inv_df['doc'] = doh_fallback.values
         inv_df['str'] = 0.0
-        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
 
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
@@ -286,13 +288,14 @@ def parse_bigbasket(inv_df, sales_df=None):
         # Where no sales matched, fall back to BB's own SOH Day of Cover
         inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
         # DRR: from sales where available, back-computed from DOH fallback otherwise
-        fallback_drr = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        # Only back-compute when doh > 0 — doh=0 means no data, so DRR is unknown (0)
+        fallback_drr = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
         # No sales file: use BB's pre-computed SOH Day of Cover directly
         inv_df['str'] = 0.0
         inv_df['doc'] = doh_fallback.values
-        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
 
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
