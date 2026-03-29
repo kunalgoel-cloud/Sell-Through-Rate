@@ -559,5 +559,141 @@ if uploaded_data:
                 }).applymap(color_doc, subset=['doc']),
                 use_container_width=True
             )
+
+        # --- 6. ACTIONABLE QUADRANT TABS ---
+        st.divider()
+        st.subheader("🎯 Actionable Quadrants")
+
+        # Thresholds derived from actual data distribution (p50 DOC ≈ 90d, p50 STR ≈ 20%)
+        DOC_THRESH = 90   # days — below this = Low DOC (running out)
+        STR_THRESH = 20   # % — below this = Low STR (slow mover)
+
+        # Work from the full filtered_df (not table_df) so quadrants reflect all inventory,
+        # unaffected by the actionable sliders — gives complete picture per quadrant
+        quad_df = filtered_df[(filtered_df['doc'] > 0) & (filtered_df['doc'] < 9999)].copy()
+        quad_df['str_pct'] = quad_df['str'] * 100
+
+        q1 = quad_df[(quad_df['str_pct'] >= STR_THRESH) & (quad_df['doc'] <  DOC_THRESH)].sort_values('doc')
+        q2 = quad_df[(quad_df['str_pct'] <  STR_THRESH) & (quad_df['doc'] >= DOC_THRESH)].sort_values('doc', ascending=False)
+        q3 = quad_df[(quad_df['str_pct'] >= STR_THRESH) & (quad_df['doc'] >= DOC_THRESH)].sort_values('doc', ascending=False)
+        q4 = quad_df[(quad_df['str_pct'] <  STR_THRESH) & (quad_df['doc'] <  DOC_THRESH)].sort_values('doc')
+
+        tab_labels = [
+            f"🔴 Reorder Now ({len(q1)})",
+            f"🟡 Run Promotion ({len(q2)})",
+            f"🟢 Improve Visibility ({len(q3)})",
+            f"⚫ SKU Rationalise ({len(q4)})",
+        ]
+        t1, t2, t3, t4 = st.tabs(tab_labels)
+
+        quad_display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
+        quad_fmt = {'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'}
+
+        def download_csv(df, cols, label, filename):
+            """Render a download button for a quadrant dataframe."""
+            export = df[cols].copy()
+            export['str'] = (export['str'] * 100).round(2).astype(str) + '%'
+            export['doc'] = export['doc'].round(1)
+            export['drr'] = export['drr'].round(2)
+            csv_bytes = export.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label=f"⬇️ Download {label} as CSV",
+                data=csv_bytes,
+                file_name=filename,
+                mime='text/csv',
+                use_container_width=True,
+            )
+
+        def quad_summary(df, inv_col='inventory', doc_col='doc', str_col='str_pct'):
+            n = len(df)
+            total_inv = df[inv_col].sum()
+            avg_doc = (df[doc_col] * df[inv_col]).sum() / df[inv_col].sum() if total_inv > 0 else 0
+            avg_str = df[str_col].mean()
+            return n, total_inv, avg_doc, avg_str
+
+        with t1:
+            st.markdown(
+                "**High STR + Low DOC** — Hot sellers running out fast. "
+                f"Threshold: STR ≥ {STR_THRESH}%, DOC < {DOC_THRESH} days."
+            )
+            st.caption("Action: **Reorder immediately**; consider increasing the next order size.")
+            if q1.empty:
+                st.success("✅ No SKUs in this quadrant.")
+            else:
+                n, inv, doc, str_ = quad_summary(q1)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SKU-locations", n)
+                c2.metric("Total Inventory", f"{inv:,.0f} units")
+                c3.metric("Avg DOC", f"{doc:.1f} days")
+                st.dataframe(
+                    q1[quad_display_cols].reset_index(drop=True)
+                    .style.format(quad_fmt).applymap(color_doc, subset=['doc']),
+                    use_container_width=True
+                )
+                download_csv(q1, quad_display_cols, "Reorder Now", "reorder_now.csv")
+
+        with t2:
+            st.markdown(
+                "**Low STR + High DOC** — Slow movers; overstocked. "
+                f"Threshold: STR < {STR_THRESH}%, DOC ≥ {DOC_THRESH} days."
+            )
+            st.caption("Action: **Run a promotion**, bundle the item, or stop future orders.")
+            if q2.empty:
+                st.success("✅ No SKUs in this quadrant.")
+            else:
+                n, inv, doc, str_ = quad_summary(q2)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SKU-locations", n)
+                c2.metric("Total Inventory", f"{inv:,.0f} units")
+                c3.metric("Avg DOC", f"{doc:.1f} days")
+                st.dataframe(
+                    q2[quad_display_cols].reset_index(drop=True)
+                    .style.format(quad_fmt).applymap(color_doc, subset=['doc']),
+                    use_container_width=True
+                )
+                download_csv(q2, quad_display_cols, "Run Promotion", "run_promotion.csv")
+
+        with t3:
+            st.markdown(
+                "**High STR + High DOC** — High demand but massive oversupply. "
+                f"Threshold: STR ≥ {STR_THRESH}%, DOC ≥ {DOC_THRESH} days."
+            )
+            st.caption("Action: **Improve visibility/merchandising** to maintain the high sales pace.")
+            if q3.empty:
+                st.success("✅ No SKUs in this quadrant.")
+            else:
+                n, inv, doc, str_ = quad_summary(q3)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SKU-locations", n)
+                c2.metric("Total Inventory", f"{inv:,.0f} units")
+                c3.metric("Avg DOC", f"{doc:.1f} days")
+                st.dataframe(
+                    q3[quad_display_cols].reset_index(drop=True)
+                    .style.format(quad_fmt).applymap(color_doc, subset=['doc']),
+                    use_container_width=True
+                )
+                download_csv(q3, quad_display_cols, "Improve Visibility", "improve_visibility.csv")
+
+        with t4:
+            st.markdown(
+                "**Low STR + Low DOC** — Poor demand and low stock. "
+                f"Threshold: STR < {STR_THRESH}%, DOC < {DOC_THRESH} days."
+            )
+            st.caption("Action: Likely a candidate for **SKU rationalisation** (discontinuing the item).")
+            if q4.empty:
+                st.success("✅ No SKUs in this quadrant.")
+            else:
+                n, inv, doc, str_ = quad_summary(q4)
+                c1, c2, c3 = st.columns(3)
+                c1.metric("SKU-locations", n)
+                c2.metric("Total Inventory", f"{inv:,.0f} units")
+                c3.metric("Avg DOC", f"{doc:.1f} days")
+                st.dataframe(
+                    q4[quad_display_cols].reset_index(drop=True)
+                    .style.format(quad_fmt).applymap(color_doc, subset=['doc']),
+                    use_container_width=True
+                )
+                download_csv(q4, quad_display_cols, "SKU Rationalise", "sku_rationalise.csv")
+
 else:
     st.info("Upload channel files to generate the dashboard.")
