@@ -92,8 +92,9 @@ def parse_amazon(inv_df, sales_df=None, sales_filename=None):
             sales_val = pd.to_numeric(inv_df['Ordered Units'], errors='coerce').fillna(0)
 
     # DOC uses actual day span; STR stays as Amazon-reported value (more accurate than recomputing)
-    inv_df['doc'] = inv_df['inventory'] / (sales_val / n_days).replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
+    inv_df['drr'] = (sales_val / n_days).round(2)
+    inv_df['doc'] = inv_df['inventory'] / inv_df['drr'].replace(0, 0.001)
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
 def parse_blinkit(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -148,17 +149,20 @@ def parse_blinkit(inv_df, sales_df=None):
         last30 = pd.to_numeric(inv_df.get('Last 30 days', pd.Series(0, index=inv_df.index)),
                                errors='coerce').fillna(0)
         computed_doc = inv_df['inventory'] / daily_rate
-        # Where sales joined as zero, use Last 30 days from inventory report as fallback
-        inv_df['doc'] = computed_doc.where(sales_val > 0,
-                        inv_df['inventory'] / (last30 / 30).replace(0, 0.001))
+        fallback_doc = inv_df['inventory'] / (last30 / 30).replace(0, 0.001)
+        inv_df['doc'] = computed_doc.where(sales_val > 0, fallback_doc)
+        # DRR: from sales where available, back-computed from fallback doc otherwise
+        fallback_drr = (last30 / 30).round(2)
+        inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
         # No sales file: use Last 30 days column from inventory report directly
         last30 = pd.to_numeric(inv_df.get('Last 30 days', pd.Series(0, index=inv_df.index)),
                                errors='coerce').fillna(0)
         inv_df['str'] = last30 / (last30 + inv_df['inventory']).replace(0, 1)
         inv_df['doc'] = inv_df['inventory'] / (last30 / 30).replace(0, 0.001)
+        inv_df['drr'] = (last30 / 30).round(2)
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
 def parse_swiggy(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -205,12 +209,16 @@ def parse_swiggy(inv_df, sales_df=None):
         # For locations with zero sales in the window, fall back to DaysOnHand
         computed_doc = inv_df['inventory'] / daily_rate
         inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
+        # DRR: from sales where available, back-computed from DaysOnHand fallback otherwise
+        fallback_drr = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
         # No sales file: use Swiggy's own DaysOnHand as DOC, STR unavailable
         inv_df['doc'] = doh_fallback.values
         inv_df['str'] = 0.0
+        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
     import re
@@ -277,12 +285,16 @@ def parse_bigbasket(inv_df, sales_df=None):
         computed_doc = inv_df['inventory'] / daily_rate
         # Where no sales matched, fall back to BB's own SOH Day of Cover
         inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
+        # DRR: from sales where available, back-computed from DOH fallback otherwise
+        fallback_drr = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
+        inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
     else:
         # No sales file: use BB's pre-computed SOH Day of Cover directly
         inv_df['str'] = 0.0
         inv_df['doc'] = doh_fallback.values
+        inv_df['drr'] = (inv_df['inventory'] / doh_fallback.replace(0, 0.001)).round(2)
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
 
 # --- MAIN APP ---
 init_db()
@@ -399,10 +411,10 @@ if uploaded_data:
             else:
                 return ''  # inherit default — 'white' was invisible on white background
 
-        display_cols = ['master_sku', 'channel', 'location', 'inventory', 'doc', 'str']
+        display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
         st.dataframe(
             filtered_df[display_cols].sort_values('doc').style.format({
-                'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}'
+                'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
             }).applymap(color_doc, subset=['doc']),
             use_container_width=True
         )
