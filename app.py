@@ -54,28 +54,45 @@ def save_mapping_to_db(new_entries):
 
 # --- CHANNEL PARSERS (FIXED ATTRIBUTE ERRORS) ---
 
-def parse_amazon(inv_df, sales_df=None):
+def parse_amazon(inv_df, sales_df=None, sales_filename=None):
+    import re
     inv_df = inv_df.copy()
     sku_c = find_col(inv_df, ['ASIN', 'asin', 'sku'])
     inv_df['channel_sku'] = inv_df[sku_c].astype(str).str.strip() if sku_c else ""
     inv_df['inventory'] = pd.to_numeric(inv_df['Sellable On Hand Units'], errors='coerce').fillna(0)
     inv_df['location'] = "National"
+
+    # Amazon provides Sell-Through % in the inventory report — use it directly
     inv_df['str'] = 0.0
     if 'Sell-Through %' in inv_df.columns:
-        inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
-    
-    # Initialize sales_val as a Series of zeros
-    sales_val = pd.Series(0, index=inv_df.index)
+        inv_df['str'] = pd.to_numeric(
+            inv_df['Sell-Through %'].astype(str).str.replace('%', ''), errors='coerce'
+        ).fillna(0) / 100
+
+    # Detect date span from sales filename (pattern: D-M-YYYY_D-M-YYYY) for accurate DOC
+    n_days = 30  # safe default
+    if sales_filename:
+        dates = re.findall(r'(\d{1,2}-\d{1,2}-\d{4})', sales_filename)
+        if len(dates) == 2:
+            try:
+                d1 = pd.to_datetime(dates[0], dayfirst=True)
+                d2 = pd.to_datetime(dates[1], dayfirst=True)
+                n_days = max((d2 - d1).days + 1, 1)
+            except Exception:
+                pass
+
+    sales_val = pd.Series(0.0, index=inv_df.index)
     if sales_df is not None:
         s_sku = find_col(sales_df, ['ASIN', 'asin'])
         if s_sku:
+            sales_df = sales_df.copy()
             sales_df[s_sku] = sales_df[s_sku].astype(str).str.strip()
             sales_grp = sales_df.groupby(s_sku)['Ordered Units'].sum()
             inv_df = inv_df.merge(sales_grp, left_on='channel_sku', right_index=True, how='left').fillna(0)
-            sales_val = inv_df['Ordered Units']
-            inv_df['str'] = inv_df.apply(lambda x: x['Ordered Units'] / (x['Ordered Units'] + x['inventory']) if (x['Ordered Units'] + x['inventory']) > 0 and x['str'] == 0 else x['str'], axis=1)
-    
-    inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
+            sales_val = pd.to_numeric(inv_df['Ordered Units'], errors='coerce').fillna(0)
+
+    # DOC uses actual day span; STR stays as Amazon-reported value (more accurate than recomputing)
+    inv_df['doc'] = inv_df['inventory'] / (sales_val / n_days).replace(0, 0.001)
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_blinkit(inv_df, sales_df=None):
@@ -176,7 +193,12 @@ with c1:
     st.info("**Amazon**")
     ai = st.file_uploader("Amazon Inventory", type=f_types, key="amz_i")
     as_ = st.file_uploader("Amazon Sales", type=f_types, key="amz_s")
-    if ai: uploaded_data.append((parse_amazon(load_data(ai, 1), load_data(as_, 1) if as_ else None), 'Amazon'))
+    if ai:
+        uploaded_data.append((
+            parse_amazon(load_data(ai, 1), load_data(as_, 1) if as_ else None,
+                         sales_filename=as_.name if as_ else None),
+            'Amazon'
+        ))
 
 with c2:
     st.info("**Blinkit**")
@@ -235,19 +257,19 @@ if uploaded_data:
         st.divider()
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
-        
-        # FIXED: Weighted average DOC calculation based on city-level inventory
-        valid_doc_data = filtered_df[filtered_df['doc'] > 0]
-        if not valid_doc_data.empty:
+
+        # Weighted avg DOC: exclude rows where doc is sentinel-inflated (zero sales)
+        valid_doc_data = filtered_df[(filtered_df['doc'] > 0) & (filtered_df['doc'] < 9999)]
+        if not valid_doc_data.empty and valid_doc_data['inventory'].sum() > 0:
             weighted_doc = (valid_doc_data['doc'] * valid_doc_data['inventory']).sum() / valid_doc_data['inventory'].sum()
             m2.metric("Avg Days of Cover", f"{weighted_doc:.1f} days")
         else:
-            m2.metric("Avg Days of Cover", "0 days")
-        
-        # FIXED: Weighted average STR% calculation based on city-level inventory
-        valid_str_data = filtered_df[filtered_df['str'] > 0]
-        if not valid_str_data.empty:
-            weighted_str = (valid_str_data['str'] * valid_str_data['inventory']).sum() / valid_str_data['inventory'].sum()
+            m2.metric("Avg Days of Cover", "N/A")
+
+        # Weighted avg STR: use all rows with inventory (STR=0 is valid for unsold SKUs)
+        str_data = filtered_df[filtered_df['inventory'] > 0]
+        if not str_data.empty:
+            weighted_str = (str_data['str'] * str_data['inventory']).sum() / str_data['inventory'].sum()
             m3.metric("Avg Sell-Through %", f"{weighted_str:.2%}")
         else:
             m3.metric("Avg Sell-Through %", "0.00%")
