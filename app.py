@@ -17,11 +17,9 @@ COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 
 # --- HELPER: FILE LOADER ---
 def load_data(uploaded_file, skiprows=0):
-    """Helper to read both CSV and Excel files"""
     if uploaded_file.name.endswith('.csv'):
         return pd.read_csv(uploaded_file, skiprows=skiprows)
     else:
-        # For Excel, skiprows works the same way
         return pd.read_excel(uploaded_file, skiprows=skiprows)
 
 # --- DB FUNCTIONS ---
@@ -52,7 +50,8 @@ def save_mapping_to_db(new_entries):
             """), entry)
         conn.commit()
 
-# --- CHANNEL PARSERS ---
+# --- CHANNEL PARSERS (WITH TYPE SAFETY) ---
+
 def parse_amazon(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['ASIN'].astype(str).str.strip()
@@ -61,9 +60,10 @@ def parse_amazon(inv_df, sales_df=None):
     
     if sales_df is not None:
         sales_df['ASIN'] = sales_df['ASIN'].astype(str).str.strip()
-        # Amazon Sales DRR based on report period (standardized to 30 days)
         drr = sales_df.groupby('ASIN')['Ordered Units'].sum() / 30
-        inv_df = inv_df.merge(drr, left_on='ASIN', right_index=True, how='left')
+        # Ensure index of drr is string to match inv_df['channel_sku']
+        drr.index = drr.index.astype(str)
+        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['Ordered Units'].replace(0, 0.001)
     else:
         inv_df['doc'] = 0
@@ -76,7 +76,8 @@ def parse_blinkit(inv_df, sales_df=None):
     if sales_df is not None:
         sales_df['Item Id'] = sales_df['Item Id'].astype(str).str.strip()
         drr = sales_df.groupby('Item Id')['Quantity'].sum() / 30
-        inv_df = inv_df.merge(drr, left_on='Item ID', right_index=True, how='left')
+        drr.index = drr.index.astype(str)
+        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['Quantity'].replace(0, 0.001)
     else:
         drr_col = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0) / 30
@@ -84,11 +85,18 @@ def parse_blinkit(inv_df, sales_df=None):
     return inv_df[['channel_sku', 'inventory', 'doc']]
 
 def parse_swiggy(inv_df, sales_df):
-    sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
-    drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
+    # Fix for the ValueError: Force both to String
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
-    inv_df = inv_df.merge(drr, left_on='SkuCode', right_index=True, how='left').fillna(0)
+    
+    sales_df = sales_df.copy()
+    sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
+    
+    drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
+    drr.index = drr.index.astype(str) # Force index to string
+    
+    # Merge on the cleaned string columns
+    inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left').fillna(0)
     inv_df['inventory'] = inv_df['WarehouseQtyAvailable']
     inv_df['doc'] = inv_df['inventory'] / inv_df['UNITS_SOLD'].replace(0, 0.001)
     return inv_df[['channel_sku', 'inventory', 'doc']]
@@ -100,7 +108,8 @@ def parse_bigbasket(inv_df, sales_df=None):
     if sales_df is not None:
         sales_df['source_sku_id'] = sales_df['source_sku_id'].astype(str).str.strip()
         drr = sales_df.groupby('source_sku_id')['total_quantity'].sum() / 30
-        inv_df = inv_df.merge(drr, left_on='SKU_Id', right_index=True, how='left')
+        drr.index = drr.index.astype(str)
+        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['total_quantity'].replace(0, 0.001)
     else:
         inv_df['doc'] = pd.to_numeric(inv_df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
@@ -113,7 +122,7 @@ db_mappings = load_mapping_from_db()
 
 st.title("🛡️ Mama Nourish | Control Center")
 
-# --- STEP 1: UPLOAD (CSV & EXCEL) ---
+# --- STEP 1: UPLOAD ---
 st.subheader("📥 Upload Reports")
 c1, c2, c3, c4 = st.columns(4)
 uploaded_data = []
@@ -158,8 +167,11 @@ if uploaded_data:
         all_dfs.append(df)
     
     combined = pd.concat(all_dfs, ignore_index=True)
-    merged = combined.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
+    # Ensure join keys are strings for Neon DB merge too
+    db_mappings['channel_sku'] = db_mappings['channel_sku'].astype(str)
+    combined['channel_sku'] = combined['channel_sku'].astype(str)
     
+    merged = combined.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
@@ -170,7 +182,7 @@ if uploaded_data:
                 chan, c_sku = row['channel'], row['channel_sku']
                 choice = st.selectbox(f"Map {chan}: {c_sku}", ["Select..."] + master_list, key=f"{chan}_{c_sku}")
                 if choice != "Select...":
-                    new_db_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
+                    new_db_entries.append({"channel": chan, "channel_sku": str(c_sku), "master_sku": choice})
             if st.form_submit_button("Sync to Neon Cloud"):
                 if new_db_entries:
                     save_mapping_to_db(new_db_entries)
