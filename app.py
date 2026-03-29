@@ -405,20 +405,20 @@ if uploaded_data:
 
         doc_range = st.sidebar.slider(
             "Days of Cover (DOC) range",
-            min_value=0, max_value=500, value=(0, 500), step=1,
-            help="Show only rows where Days of Cover falls within this range"
+            min_value=0, max_value=9999, value=(0, 9999), step=1,
+            help="Show only rows where Days of Cover falls within this range. Max 9999 covers all items including overstocked ones."
         )
         min_doc, max_doc = doc_range
 
         str_range = st.sidebar.slider(
             "Sell-Through Rate (STR) range %",
-            min_value=0, max_value=100, value=(0, 100), step=1,
-            help="Show only rows where Sell-Through Rate falls within this range"
+            min_value=0, max_value=200, value=(0, 200), step=1,
+            help="Show only rows where Sell-Through Rate falls within this range. Max 200% accommodates Amazon STR values that can exceed 100%."
         )
         min_str, max_str = str_range
 
         # --- Apply actionable filters early so metrics reflect them too ---
-        action_active = (min_doc > 0 or max_doc < 500 or min_str > 0 or max_str < 100)
+        action_active = (min_doc > 0 or max_doc < 9999 or min_str > 0 or max_str < 200)
         table_df = filtered_df[
             (filtered_df['doc'] >= min_doc) &
             (filtered_df['doc'] <= max_doc) &
@@ -430,8 +430,8 @@ if uploaded_data:
         metrics_df = table_df
 
         # Build a dynamic label suffix for metric headers
-        doc_label = f" | DOC {min_doc}–{max_doc}d" if (min_doc > 0 or max_doc < 500) else ""
-        str_label = f" | STR {min_str}–{max_str}%" if (min_str > 0 or max_str < 100) else ""
+        doc_label = f" | DOC {min_doc}–{max_doc}d" if (min_doc > 0 or max_doc < 9999) else ""
+        str_label = f" | STR {min_str}–{max_str}%" if (min_str > 0 or max_str < 200) else ""
         filter_label = doc_label + str_label
 
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
@@ -478,9 +478,9 @@ if uploaded_data:
         shown_rows = len(table_df)
         if action_active:
             filter_parts = []
-            if min_doc > 0 or max_doc < 500:
+            if min_doc > 0 or max_doc < 9999:
                 filter_parts.append(f"DOC **{min_doc}–{max_doc}** days")
-            if min_str > 0 or max_str < 100:
+            if min_str > 0 or max_str < 200:
                 filter_parts.append(f"STR **{min_str}–{max_str}%**")
             st.caption(
                 f"🎯 Showing **{shown_rows}** of {total_rows} rows — filtered by {', '.join(filter_parts)}"
