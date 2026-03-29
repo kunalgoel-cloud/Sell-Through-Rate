@@ -1,16 +1,15 @@
 import streamlit as st
 import pandas as pd
 from sqlalchemy import create_engine, text
-import os
 
 # --- DATABASE & CONFIG ---
-st.set_page_config(page_title="Mama Nourish | Inventory Control", layout="wide")
+st.set_page_config(page_title="Mama Nourish | Control Center", layout="wide")
 
 try:
     conn_url = st.secrets["connections"]["postgresql"]["url"]
     engine = create_engine(conn_url)
 except Exception:
-    st.error("Database connection string not found. Please add it to Streamlit Secrets.")
+    st.error("Database connection string not found.")
     st.stop()
 
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
@@ -50,21 +49,30 @@ def save_mapping_to_db(new_entries):
             """), entry)
         conn.commit()
 
-# --- CHANNEL PARSERS (WITH LOCATION SUPPORT) ---
+# --- REVISED CHANNEL PARSERS (AUTO-CALCULATE STR) ---
 
 def parse_amazon(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['ASIN'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Sellable On Hand Units'], errors='coerce').fillna(0)
-    inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
-    inv_df['location'] = "National" # Amazon reporting is aggregate
+    
+    # Use existing STR if available (Amazon usually has it)
+    if 'Sell-Through %' in inv_df.columns:
+        inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
+    else:
+        inv_df['str'] = 0.0
+    
+    inv_df['location'] = "National"
     
     if sales_df is not None:
         sales_df['ASIN'] = sales_df['ASIN'].astype(str).str.strip()
-        drr = sales_df.groupby('ASIN')['Ordered Units'].sum() / 30
-        drr.index = drr.index.astype(str)
-        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
-        inv_df['doc'] = inv_df['inventory'] / inv_df['Ordered Units'].replace(0, 0.001)
+        sales_sum = sales_df.groupby('ASIN')['Ordered Units'].sum()
+        inv_df = inv_df.merge(sales_sum, left_on='channel_sku', right_index=True, how='left').fillna(0)
+        
+        # If STR was 0, calculate it: Sales / (Sales + Inventory)
+        inv_df['str'] = inv_df.apply(lambda x: x['Ordered Units'] / (x['Ordered Units'] + x['inventory']) if (x['Ordered Units'] + x['inventory']) > 0 and x['str'] == 0 else x['str'], axis=1)
+        
+        inv_df['doc'] = inv_df['inventory'] / (inv_df['Ordered Units'] / 30).replace(0, 0.001)
     else:
         inv_df['doc'] = 0
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
@@ -73,35 +81,38 @@ def parse_blinkit(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['Item ID'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Total sellable'], errors='coerce').fillna(0)
-    # Blinkit uses Facility Name for location
     inv_df['location'] = inv_df['Warehouse Facility Name'] if 'Warehouse Facility Name' in inv_df.columns else ""
     
+    sales_total = 0
     if sales_df is not None:
         sales_df['Item Id'] = sales_df['Item Id'].astype(str).str.strip()
-        drr = sales_df.groupby('Item Id')['Quantity'].sum() / 30
-        drr.index = drr.index.astype(str)
-        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
-        inv_df['doc'] = inv_df['inventory'] / inv_df['Quantity'].replace(0, 0.001)
+        sales_sum = sales_df.groupby('Item Id')['Quantity'].sum()
+        inv_df = inv_df.merge(sales_sum, left_on='channel_sku', right_index=True, how='left').fillna(0)
+        sales_total = inv_df['Quantity']
     else:
-        drr_col = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0) / 30
-        inv_df['doc'] = inv_df['inventory'] / drr_col.replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
+        # Fallback to 'Last 30 days' column in inv file if sales file not uploaded
+        sales_total = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0)
+    
+    inv_df['str'] = sales_total / (sales_total + inv_df['inventory']).replace(0, 1)
+    inv_df['doc'] = inv_df['inventory'] / (sales_total / 30).replace(0, 0.001)
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_swiggy(inv_df, sales_df):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
-    # Swiggy location: City + Facility
     inv_df['location'] = inv_df['City'] + " (" + inv_df['FacilityName'] + ")"
     
     sales_df = sales_df.copy()
     sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
-    drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
-    drr.index = drr.index.astype(str)
+    sales_sum = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum()
     
-    inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left').fillna(0)
+    inv_df = inv_df.merge(sales_sum, left_on='channel_sku', right_index=True, how='left').fillna(0)
     inv_df['inventory'] = inv_df['WarehouseQtyAvailable']
-    inv_df['doc'] = inv_df['inventory'] / inv_df['UNITS_SOLD'].replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
+    
+    # Calculate STR
+    inv_df['str'] = inv_df['UNITS_SOLD'] / (inv_df['UNITS_SOLD'] + inv_df['inventory']).replace(0, 1)
+    inv_df['doc'] = inv_df['inventory'] / (inv_df['UNITS_SOLD'] / 30).replace(0, 0.001)
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -109,15 +120,18 @@ def parse_bigbasket(inv_df, sales_df=None):
     inv_df['inventory'] = pd.to_numeric(inv_df['Total SOH'], errors='coerce').fillna(0)
     inv_df['location'] = inv_df['DC'] if 'DC' in inv_df.columns else ""
     
+    sales_total = 0
     if sales_df is not None:
         sales_df['source_sku_id'] = sales_df['source_sku_id'].astype(str).str.strip()
-        drr = sales_df.groupby('source_sku_id')['total_quantity'].sum() / 30
-        drr.index = drr.index.astype(str)
-        inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
-        inv_df['doc'] = inv_df['inventory'] / inv_df['total_quantity'].replace(0, 0.001)
+        sales_sum = sales_df.groupby('source_sku_id')['total_quantity'].sum()
+        inv_df = inv_df.merge(sales_sum, left_on='channel_sku', right_index=True, how='left').fillna(0)
+        sales_total = inv_df['total_quantity']
     else:
-        inv_df['doc'] = pd.to_numeric(inv_df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
-    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
+        sales_total = 0 # Cannot calculate STR without sales file for BB
+        
+    inv_df['str'] = sales_total / (sales_total + inv_df['inventory']).replace(0, 1) if sales_df is not None else 0
+    inv_df['doc'] = inv_df['inventory'] / (sales_total / 30).replace(0, 0.001) if sales_df is not None else 0
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 # --- MAIN APP ---
 init_db()
@@ -210,9 +224,8 @@ if uploaded_data:
         st.divider()
         m1, m2, m3 = st.columns(3)
         total_inv = filtered_df['inventory'].sum()
-        # Filter out 0 for averages to avoid skewing
         avg_doc = filtered_df[filtered_df['doc'] > 0]['doc'].mean() if not filtered_df.empty else 0
-        avg_str = filtered_df[filtered_df['str'] > 0]['str'].mean() if 'str' in filtered_df.columns else 0
+        avg_str = filtered_df[filtered_df['str'] > 0]['str'].mean() if not filtered_df.empty else 0
 
         m1.metric("Total Inventory", f"{total_inv:,.0f} units")
         m2.metric("Avg Days of Cover", f"{avg_doc:.1f} days")
@@ -221,9 +234,6 @@ if uploaded_data:
         # --- DASHBOARD ---
         st.subheader("📊 Detailed Inventory Health")
         
-        for col in ['doc', 'str', 'location']:
-            if col not in filtered_df.columns: filtered_df[col] = 0 if col != 'location' else ""
-
         def style_metrics(df):
             return df.style.format({
                 'str': '{:.2%}',
@@ -234,4 +244,4 @@ if uploaded_data:
         display_cols = ['master_sku', 'channel', 'location', 'inventory', 'doc', 'str']
         st.dataframe(style_metrics(filtered_df[display_cols].sort_values('doc')), use_container_width=True)
 else:
-    st.info("Upload CSV or Excel exports to begin.")
+    st.info("Upload channel files to begin.")
