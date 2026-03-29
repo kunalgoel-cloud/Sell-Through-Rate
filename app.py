@@ -403,19 +403,44 @@ if uploaded_data:
         st.sidebar.header("🎯 Actionable Filters")
         st.sidebar.caption("Metrics and table both update based on these thresholds.")
 
-        doc_range = st.sidebar.slider(
-            "Days of Cover (DOC) range",
-            min_value=0, max_value=9999, value=(0, 9999), step=1,
-            help="Show only rows where Days of Cover falls within this range. Max 9999 covers all items including overstocked ones."
+        # DOC range — slider + typed number inputs
+        st.sidebar.markdown("**Days of Cover (DOC) range**")
+        _doc_col1, _doc_col2 = st.sidebar.columns(2)
+        _doc_min_box = _doc_col1.number_input(
+            "Min days", min_value=0, max_value=9999, value=0, step=1, key="doc_min_box"
         )
-        min_doc, max_doc = doc_range
+        _doc_max_box = _doc_col2.number_input(
+            "Max days", min_value=0, max_value=9999, value=9999, step=1, key="doc_max_box"
+        )
+        _doc_slider = st.sidebar.slider(
+            "DOC slider", min_value=0, max_value=9999,
+            value=(int(_doc_min_box), int(_doc_max_box)),
+            step=1, label_visibility="collapsed"
+        )
+        # Typed input always wins; fall back to slider when boxes are at default
+        if _doc_min_box != 0 or _doc_max_box != 9999:
+            min_doc, max_doc = int(_doc_min_box), int(_doc_max_box)
+        else:
+            min_doc, max_doc = _doc_slider
 
-        str_range = st.sidebar.slider(
-            "Sell-Through Rate (STR) range %",
-            min_value=0, max_value=200, value=(0, 200), step=1,
-            help="Show only rows where Sell-Through Rate falls within this range. Max 200% accommodates Amazon STR values that can exceed 100%."
+        # STR range — slider + typed number inputs
+        st.sidebar.markdown("**Sell-Through Rate (STR) range %**")
+        _str_col1, _str_col2 = st.sidebar.columns(2)
+        _str_min_box = _str_col1.number_input(
+            "Min %", min_value=0, max_value=200, value=0, step=1, key="str_min_box"
         )
-        min_str, max_str = str_range
+        _str_max_box = _str_col2.number_input(
+            "Max %", min_value=0, max_value=200, value=200, step=1, key="str_max_box"
+        )
+        _str_slider = st.sidebar.slider(
+            "STR slider", min_value=0, max_value=200,
+            value=(int(_str_min_box), int(_str_max_box)),
+            step=1, label_visibility="collapsed"
+        )
+        if _str_min_box != 0 or _str_max_box != 200:
+            min_str, max_str = int(_str_min_box), int(_str_max_box)
+        else:
+            min_str, max_str = _str_slider
 
         # --- Apply actionable filters early so metrics reflect them too ---
         action_active = (min_doc > 0 or max_doc < 9999 or min_str > 0 or max_str < 200)
