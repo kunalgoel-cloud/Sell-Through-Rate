@@ -102,22 +102,62 @@ def parse_blinkit(inv_df, sales_df=None):
     inv_df['fac_id'] = inv_df[f_col].astype(str).str.strip() if f_col else "Unknown"
     inv_df['location'] = inv_df['fac_id']
     inv_df['inventory'] = pd.to_numeric(inv_df['Total sellable'], errors='coerce').fillna(0)
-    
-    sales_val = pd.Series(0, index=inv_df.index)
+
+    # Extract city from facility name (e.g. 'Pune P2 - Feeder' -> 'Pune')
+    # and map NCR sub-regions to their Blinkit Supply City codes
+    NCR_CITY_MAP = {
+        'Farukhnagar': 'HR-NCR', 'Kundli': 'HR-NCR', 'Faridabad': 'HR-NCR',
+        'Gurgaon': 'HR-NCR', 'Gurugram': 'HR-NCR',
+        'Noida': 'UP-NCR', 'Ghaziabad': 'UP-NCR', 'Gr.Noida': 'UP-NCR',
+    }
+    def extract_city(facility_name):
+        first_word = str(facility_name).split()[0]
+        return NCR_CITY_MAP.get(first_word, first_word)
+
+    inv_df['_city_key'] = inv_df['fac_id'].apply(extract_city)
+
+    n_days = 30  # default; overridden from date column when sales present
+    has_sales = False
+    sales_val = pd.Series(0.0, index=inv_df.index)
+
     if sales_df is not None:
-        s_sku = find_col(sales_df, ['Item Id', 'item_id'])
-        s_fac = find_col(sales_df, ['Facility Name', 'Store', 'Warehouse'])
-        if s_sku and s_fac:
-            sales_df[s_sku] = sales_df[s_sku].astype(str).str.strip()
-            sales_df['fac_id'] = sales_df[s_fac].astype(str).str.strip()
-            sales_grp = sales_df.groupby([s_sku, 'fac_id'])['Quantity'].sum().reset_index()
-            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', 'fac_id'], right_on=[s_sku, 'fac_id'], how='left').fillna(0)
-            sales_val = inv_df['Quantity']
+        sales_df = sales_df.copy()
+        s_sku = find_col(sales_df, ['Item Id', 'item_id', 'Item ID'])
+        # Blinkit sales report uses Supply City, not Facility Name
+        s_city = find_col(sales_df, ['Supply City', 'Facility Name', 'Store', 'Warehouse', 'City'])
+        # Detect actual date span for accurate DOC normalisation
+        date_col = find_col(sales_df, ['Order Date', 'OrderDate', 'Date', 'date'])
+        if date_col:
+            dates = pd.to_datetime(sales_df[date_col], errors='coerce').dropna()
+            if not dates.empty:
+                n_days = max((dates.max() - dates.min()).days + 1, 1)
+        if s_sku and s_city:
+            sales_df['c_sku'] = sales_df[s_sku].astype(str).str.strip()
+            sales_df['c_city'] = sales_df[s_city].astype(str).str.strip()
+            sales_grp = sales_df.groupby(['c_sku', 'c_city'])['Quantity'].sum().reset_index()
+            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', '_city_key'],
+                                  right_on=['c_sku', 'c_city'], how='left').fillna(0)
+            sales_val = pd.to_numeric(inv_df['Quantity'], errors='coerce').fillna(0)
+            has_sales = True
+
+    if has_sales:
+        # Sales file: normalise to day span; fall back to Last 30 days for zero-sales locations
+        daily_rate = (sales_val / n_days).replace(0, 0.001)
+        sales_30d = sales_val * (30 / n_days)
+        inv_df['str'] = sales_30d / (sales_30d + inv_df['inventory']).replace(0, 1)
+        last30 = pd.to_numeric(inv_df.get('Last 30 days', pd.Series(0, index=inv_df.index)),
+                               errors='coerce').fillna(0)
+        computed_doc = inv_df['inventory'] / daily_rate
+        # Where sales joined as zero, use Last 30 days from inventory report as fallback
+        inv_df['doc'] = computed_doc.where(sales_val > 0,
+                        inv_df['inventory'] / (last30 / 30).replace(0, 0.001))
     else:
-        sales_val = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0)
-    
-    inv_df['str'] = sales_val / (sales_val + inv_df['inventory']).replace(0, 1)
-    inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
+        # No sales file: use Last 30 days column from inventory report directly
+        last30 = pd.to_numeric(inv_df.get('Last 30 days', pd.Series(0, index=inv_df.index)),
+                               errors='coerce').fillna(0)
+        inv_df['str'] = last30 / (last30 + inv_df['inventory']).replace(0, 1)
+        inv_df['doc'] = inv_df['inventory'] / (last30 / 30).replace(0, 0.001)
+
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_swiggy(inv_df, sales_df=None):
