@@ -1,31 +1,54 @@
 import streamlit as st
 import pandas as pd
+from sqlalchemy import create_engine, text
 import os
 
-# --- CONFIG & PERSISTENCE ---
-st.set_page_config(page_title="Mama Nourish Inventory Engine", layout="wide")
-MAPPING_FILE = "mapping_db.csv"
+# --- DATABASE & CONFIG ---
+st.set_page_config(page_title="Mama Nourish | Inventory & Sales Hub", layout="wide")
+
+# This assumes you added [connections.postgresql] url = "..." to your secrets
+try:
+    conn_url = st.secrets["connections"]["postgresql"]["url"]
+    engine = create_engine(conn_url)
+except Exception as e:
+    st.error("Database connection string not found in secrets. Please check your .streamlit/secrets.toml")
+    st.stop()
+
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 
-# Initialize local mapping database if it doesn't exist
-if not os.path.exists(MAPPING_FILE):
-    pd.DataFrame(columns=["channel", "channel_sku", "master_sku"]).to_csv(MAPPING_FILE, index=False)
+# --- DB FUNCTIONS ---
 
-def load_master_skus():
-    try:
-        df = pd.read_csv(COMMON_SKU_FILE)
-        return sorted(df['name'].unique().tolist())
-    except:
-        return []
+def init_db():
+    """Create the mapping table in Neon if it doesn't exist"""
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS sku_mappings (
+                id SERIAL PRIMARY KEY,
+                channel TEXT NOT NULL,
+                channel_sku TEXT NOT NULL,
+                master_sku TEXT NOT NULL,
+                UNIQUE(channel, channel_sku)
+            );
+        """))
+        conn.commit()
 
-def load_mapping():
-    return pd.read_csv(MAPPING_FILE).astype(str)
+def load_mapping_from_db():
+    query = "SELECT channel, channel_sku, master_sku FROM sku_mappings"
+    return pd.read_sql(query, engine).astype(str)
 
-def save_new_mappings(new_entries):
-    current_df = load_mapping()
-    new_df = pd.DataFrame(new_entries)
-    updated_df = pd.concat([current_df, new_df], ignore_index=True).drop_duplicates(subset=['channel', 'channel_sku'])
-    updated_df.to_csv(MAPPING_FILE, index=False)
+def save_mapping_to_db(new_entries):
+    with engine.connect() as conn:
+        for entry in new_entries:
+            conn.execute(
+                text("""
+                    INSERT INTO sku_mappings (channel, channel_sku, master_sku)
+                    VALUES (:channel, :channel_sku, :master_sku)
+                    ON CONFLICT (channel, channel_sku) 
+                    DO UPDATE SET master_sku = EXCLUDED.master_sku
+                """),
+                entry
+            )
+        conn.commit()
 
 # --- CHANNEL PARSERS ---
 
@@ -33,72 +56,93 @@ def parse_amazon(df):
     df = df.copy()
     df['channel_sku'] = df['ASIN'].astype(str).str.strip()
     df['inventory'] = pd.to_numeric(df['Sellable On Hand Units'], errors='coerce').fillna(0)
-    # Amazon provides STR directly
     df['str'] = pd.to_numeric(df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
-    df['doc'] = 0 # Amazon logic usually uses STR
+    df['doc'] = 0 
     return df[['channel_sku', 'inventory', 'str', 'doc']]
 
-def parse_blinkit(df):
-    df = df.copy()
-    df['channel_sku'] = df['Item ID'].astype(str).str.strip()
-    df['inventory'] = pd.to_numeric(df['Total sellable'], errors='coerce').fillna(0)
-    drr = pd.to_numeric(df['Last 30 days'], errors='coerce').fillna(0) / 30
-    df['doc'] = df['inventory'] / drr.replace(0, 0.001)
-    df['str'] = 0
-    return df[['channel_sku', 'inventory', 'doc', 'str']]
+def parse_blinkit(inv_df, sales_df=None):
+    inv_df = inv_df.copy()
+    inv_df['channel_sku'] = inv_df['Item ID'].astype(str).str.strip()
+    inv_df['inventory'] = pd.to_numeric(inv_df['Total sellable'], errors='coerce').fillna(0)
+    
+    if sales_df is not None:
+        sales_df['Item Id'] = sales_df['Item Id'].astype(str).str.strip()
+        drr = sales_df.groupby('Item Id')['Quantity'].sum() / 30
+        inv_df = inv_df.merge(drr, left_on='Item ID', right_index=True, how='left')
+        inv_df['doc'] = inv_df['inventory'] / inv_df['Quantity'].replace(0, 0.001)
+    else:
+        drr = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0) / 30
+        inv_df['doc'] = inv_df['inventory'] / drr.replace(0, 0.001)
+    return inv_df[['channel_sku', 'inventory', 'doc']]
 
 def parse_swiggy(inv_df, sales_df):
+    sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
     drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
     inv_df = inv_df.merge(drr, left_on='SkuCode', right_index=True, how='left').fillna(0)
     inv_df['inventory'] = inv_df['WarehouseQtyAvailable']
     inv_df['doc'] = inv_df['inventory'] / inv_df['UNITS_SOLD'].replace(0, 0.001)
-    inv_df['str'] = 0
-    return inv_df[['channel_sku', 'inventory', 'doc', 'str']]
+    return inv_df[['channel_sku', 'inventory', 'doc']]
 
-def parse_bigbasket(df):
-    df = df.copy()
-    df['channel_sku'] = df['SKU_Id'].astype(str).str.strip()
-    df['inventory'] = pd.to_numeric(df['Total SOH'], errors='coerce').fillna(0)
-    df['doc'] = pd.to_numeric(df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
-    df['str'] = 0
-    return df[['channel_sku', 'inventory', 'doc', 'str']]
+def parse_bigbasket(inv_df, sales_df=None):
+    inv_df = inv_df.copy()
+    inv_df['channel_sku'] = inv_df['SKU_Id'].astype(str).str.strip()
+    inv_df['inventory'] = pd.to_numeric(inv_df['Total SOH'], errors='coerce').fillna(0)
+    
+    if sales_df is not None:
+        sales_df['source_sku_id'] = sales_df['source_sku_id'].astype(str).str.strip()
+        drr = sales_df.groupby('source_sku_id')['total_quantity'].sum() / 30
+        inv_df = inv_df.merge(drr, left_on='SKU_Id', right_index=True, how='left')
+        inv_df['doc'] = inv_df['inventory'] / inv_df['total_quantity'].replace(0, 0.001)
+    else:
+        inv_df['doc'] = pd.to_numeric(inv_df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
+    return inv_df[['channel_sku', 'inventory', 'doc']]
 
-# --- APP UI ---
+# --- MAIN APP ---
 
-st.title("🛡️ Mama Nourish Inventory Control")
+init_db()
+master_list = pd.read_csv(COMMON_SKU_FILE)['name'].unique().tolist()
+db_mappings = load_mapping_from_db()
 
-MASTER_SKU_LIST = load_master_skus()
-MAPPING_DB = load_mapping()
+st.title("🛡️ Mama Nourish | Cloud-Synced Inventory Control")
 
-# 1. FILE UPLOADS
-st.subheader("📥 Upload Channel Files")
-cols = st.columns(4)
+# 1. UPLOAD SECTION
+st.subheader("📥 Step 1: Upload Channel Reports")
+c1, c2, c3, c4 = st.columns(4)
+
 uploaded_data = []
 
-with cols[0]:
-    amz = st.file_uploader("Amazon", type="csv")
-    if amz:
-        uploaded_data.append((parse_amazon(pd.read_csv(amz, skiprows=1)), 'Amazon'))
+with c1:
+    st.info("**Amazon**")
+    amz_i = st.file_uploader("Inventory (ASIN)", type="csv")
+    if amz_i:
+        uploaded_data.append((parse_amazon(pd.read_csv(amz_i, skiprows=1)), 'Amazon'))
 
-with cols[1]:
-    blk = st.file_uploader("Blinkit", type="csv")
-    if blk:
-        uploaded_data.append((parse_blinkit(pd.read_csv(blk, skiprows=2)), 'Blinkit'))
+with c2:
+    st.info("**Blinkit**")
+    blk_i = st.file_uploader("Blinkit Inventory", type="csv")
+    blk_s = st.file_uploader("Blinkit Sales (MTD)", type="csv")
+    if blk_i:
+        s_df = pd.read_csv(blk_s) if blk_s else None
+        uploaded_data.append((parse_blinkit(pd.read_csv(blk_i, skiprows=2), s_df), 'Blinkit'))
 
-with cols[2]:
-    swg_i = st.file_uploader("Swiggy Inv", type="csv")
+with c3:
+    st.info("**Swiggy**")
+    swg_i = st.file_uploader("Swiggy Inventory", type="csv")
     swg_s = st.file_uploader("Swiggy Sales", type="csv")
     if swg_i and swg_s:
         uploaded_data.append((parse_swiggy(pd.read_csv(swg_i), pd.read_csv(swg_s)), 'Swiggy'))
 
-with cols[3]:
-    bb = st.file_uploader("Big Basket", type="csv")
-    if bb:
-        uploaded_data.append((parse_bigbasket(pd.read_csv(bb)), 'Big Basket'))
+with c4:
+    st.info("**Big Basket**")
+    bb_i = st.file_uploader("BB Inventory", type="csv")
+    bb_s = st.file_uploader("BB Sales (Alpha)", type="csv")
+    if bb_i:
+        s_df = pd.read_csv(bb_s) if bb_s else None
+        uploaded_data.append((parse_bigbasket(pd.read_csv(bb_i), s_df), 'Big Basket'))
 
-# 2. PROCESSING & MAPPING
+# 2. PROCESSING & CLOUD MAPPING
 if uploaded_data:
     raw_dfs = []
     for df, channel in uploaded_data:
@@ -107,40 +151,42 @@ if uploaded_data:
     
     combined_raw = pd.concat(raw_dfs, ignore_index=True)
     
-    # Merge with existing mapping
-    merged = combined_raw.merge(MAPPING_DB, on=['channel', 'channel_sku'], how='left')
-    
-    # Check for unmapped items
+    # Merge with Neon DB mappings
+    merged = combined_raw.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
-        st.warning(f"🚨 {len(unmapped)} New SKUs detected. Map them below to continue.")
-        with st.form("mapping_wizard"):
-            new_mapping_entries = []
+        st.warning(f"🚨 {len(unmapped)} New SKUs found. Link them once to save to Neon DB.")
+        with st.form("db_mapping_form"):
+            new_db_entries = []
             for _, row in unmapped.iterrows():
                 chan, c_sku = row['channel'], row['channel_sku']
-                choice = st.selectbox(f"Map {chan} ID: {c_sku}", ["Select..."] + MASTER_SKU_LIST, key=f"{chan}_{c_sku}")
+                choice = st.selectbox(f"Map {chan} ID: {c_sku}", ["Select..."] + master_list, key=f"{chan}_{c_sku}")
                 if choice != "Select...":
-                    new_mapping_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
+                    new_db_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
             
-            if st.form_submit_button("Save Mappings & Update Dashboard"):
-                if new_mapping_entries:
-                    save_new_mappings(new_mapping_entries)
+            if st.form_submit_button("Permanent Save to Neon DB"):
+                if new_db_entries:
+                    save_mapping_to_db(new_db_entries)
+                    st.success("Successfully saved to Neon Cloud!")
                     st.rerun()
     else:
         # 3. FINAL DASHBOARD
         st.divider()
         st.subheader("📊 Consolidated Inventory Health")
         
-        # UI Table with Risk Colors
-        def highlight_risks(val):
+        # UI Formatting
+        def color_risk(val):
             if isinstance(val, float) and 0 < val < 15:
                 return 'background-color: #ff4b4b; color: white'
             return ''
 
+        # Group by Master SKU for the view
+        view_df = merged[['master_sku', 'channel', 'inventory', 'doc']].sort_values('doc')
+        
         st.dataframe(
-            merged[['master_sku', 'channel', 'inventory', 'doc', 'str']].style.applymap(highlight_risks, subset=['doc']),
+            view_df.style.applymap(color_risk, subset=['doc']),
             use_container_width=True
         )
 else:
-    st.info("Upload channel files to generate the report.")
+    st.info("Please upload your channel files to begin.")
