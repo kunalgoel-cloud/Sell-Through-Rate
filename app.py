@@ -4,14 +4,13 @@ from sqlalchemy import create_engine, text
 import os
 
 # --- DATABASE & CONFIG ---
-st.set_page_config(page_title="Mama Nourish | Inventory & Sales Hub", layout="wide")
+st.set_page_config(page_title="Mama Nourish | Cloud Inventory Hub", layout="wide")
 
-# This assumes you added [connections.postgresql] url = "..." to your secrets
 try:
     conn_url = st.secrets["connections"]["postgresql"]["url"]
     engine = create_engine(conn_url)
 except Exception as e:
-    st.error("Database connection string not found in secrets. Please check your .streamlit/secrets.toml")
+    st.error("Neon Connection string not found in secrets.")
     st.stop()
 
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
@@ -19,7 +18,6 @@ COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 # --- DB FUNCTIONS ---
 
 def init_db():
-    """Create the mapping table in Neon if it doesn't exist"""
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS sku_mappings (
@@ -52,10 +50,15 @@ def save_mapping_to_db(new_entries):
 
 # --- CHANNEL PARSERS ---
 
+def calculate_str(sold, inv):
+    total = sold + inv
+    return sold / total if total > 0 else 0
+
 def parse_amazon(df):
     df = df.copy()
     df['channel_sku'] = df['ASIN'].astype(str).str.strip()
     df['inventory'] = pd.to_numeric(df['Sellable On Hand Units'], errors='coerce').fillna(0)
+    # Amazon report provides STR directly as a percentage string
     df['str'] = pd.to_numeric(df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
     df['doc'] = 0 
     return df[['channel_sku', 'inventory', 'str', 'doc']]
@@ -67,23 +70,27 @@ def parse_blinkit(inv_df, sales_df=None):
     
     if sales_df is not None:
         sales_df['Item Id'] = sales_df['Item Id'].astype(str).str.strip()
-        drr = sales_df.groupby('Item Id')['Quantity'].sum() / 30
-        inv_df = inv_df.merge(drr, left_on='Item ID', right_index=True, how='left')
-        inv_df['doc'] = inv_df['inventory'] / inv_df['Quantity'].replace(0, 0.001)
+        sales_totals = sales_df.groupby('Item Id')['Quantity'].sum()
+        inv_df = inv_df.merge(sales_totals, left_on='Item ID', right_index=True, how='left').fillna(0)
+        inv_df['doc'] = inv_df['inventory'] / (inv_df['Quantity'] / 30).replace(0, 0.001)
+        inv_df['str'] = inv_df.apply(lambda x: calculate_str(x['Quantity'], x['inventory']), axis=1)
     else:
-        drr = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0) / 30
-        inv_df['doc'] = inv_df['inventory'] / drr.replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+        # Fallback to 30d column in inventory report
+        sold_30 = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0)
+        inv_df['doc'] = inv_df['inventory'] / (sold_30 / 30).replace(0, 0.001)
+        inv_df['str'] = inv_df.apply(lambda x: calculate_str(sold_30, x['inventory']), axis=1)
+    return inv_df[['channel_sku', 'inventory', 'doc', 'str']]
 
 def parse_swiggy(inv_df, sales_df):
     sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
-    drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
+    sales_totals = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum()
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
-    inv_df = inv_df.merge(drr, left_on='SkuCode', right_index=True, how='left').fillna(0)
+    inv_df = inv_df.merge(sales_totals, left_on='SkuCode', right_index=True, how='left').fillna(0)
     inv_df['inventory'] = inv_df['WarehouseQtyAvailable']
-    inv_df['doc'] = inv_df['inventory'] / inv_df['UNITS_SOLD'].replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+    inv_df['doc'] = inv_df['inventory'] / (inv_df['UNITS_SOLD'] / 30).replace(0, 0.001)
+    inv_df['str'] = inv_df.apply(lambda x: calculate_str(x['UNITS_SOLD'], x['inventory']), axis=1)
+    return inv_df[['channel_sku', 'inventory', 'doc', 'str']]
 
 def parse_bigbasket(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -92,12 +99,14 @@ def parse_bigbasket(inv_df, sales_df=None):
     
     if sales_df is not None:
         sales_df['source_sku_id'] = sales_df['source_sku_id'].astype(str).str.strip()
-        drr = sales_df.groupby('source_sku_id')['total_quantity'].sum() / 30
-        inv_df = inv_df.merge(drr, left_on='SKU_Id', right_index=True, how='left')
-        inv_df['doc'] = inv_df['inventory'] / inv_df['total_quantity'].replace(0, 0.001)
+        sales_totals = sales_df.groupby('source_sku_id')['total_quantity'].sum()
+        inv_df = inv_df.merge(sales_totals, left_on='SKU_Id', right_index=True, how='left').fillna(0)
+        inv_df['doc'] = inv_df['inventory'] / (inv_df['total_quantity'] / 30).replace(0, 0.001)
+        inv_df['str'] = inv_df.apply(lambda x: calculate_str(x['total_quantity'], x['inventory']), axis=1)
     else:
         inv_df['doc'] = pd.to_numeric(inv_df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+        inv_df['str'] = 0 # Cannot calculate STR without sales file for BB
+    return inv_df[['channel_sku', 'inventory', 'doc', 'str']]
 
 # --- MAIN APP ---
 
@@ -105,12 +114,11 @@ init_db()
 master_list = pd.read_csv(COMMON_SKU_FILE)['name'].unique().tolist()
 db_mappings = load_mapping_from_db()
 
-st.title("🛡️ Mama Nourish | Cloud-Synced Inventory Control")
+st.title("🛡️ Mama Nourish | Cloud Inventory & STR Hub")
 
 # 1. UPLOAD SECTION
-st.subheader("📥 Step 1: Upload Channel Reports")
+st.subheader("📥 Step 1: Upload Reports")
 c1, c2, c3, c4 = st.columns(4)
-
 uploaded_data = []
 
 with c1:
@@ -144,19 +152,14 @@ with c4:
 
 # 2. PROCESSING & CLOUD MAPPING
 if uploaded_data:
-    raw_dfs = []
-    for df, channel in uploaded_data:
-        df['channel'] = channel
-        raw_dfs.append(df)
-    
+    raw_dfs = [df.assign(channel=channel) for df, channel in uploaded_data]
     combined_raw = pd.concat(raw_dfs, ignore_index=True)
-    
-    # Merge with Neon DB mappings
     merged = combined_raw.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
+    
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
-        st.warning(f"🚨 {len(unmapped)} New SKUs found. Link them once to save to Neon DB.")
+        st.warning(f"🚨 {len(unmapped)} New SKUs found.")
         with st.form("db_mapping_form"):
             new_db_entries = []
             for _, row in unmapped.iterrows():
@@ -165,28 +168,23 @@ if uploaded_data:
                 if choice != "Select...":
                     new_db_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
             
-            if st.form_submit_button("Permanent Save to Neon DB"):
+            if st.form_submit_button("Save to Neon Cloud"):
                 if new_db_entries:
                     save_mapping_to_db(new_db_entries)
-                    st.success("Successfully saved to Neon Cloud!")
                     st.rerun()
     else:
         # 3. FINAL DASHBOARD
         st.divider()
-        st.subheader("📊 Consolidated Inventory Health")
+        st.subheader("📊 Global Health: Inventory, DoC & STR")
         
         # UI Formatting
-        def color_risk(val):
-            if isinstance(val, float) and 0 < val < 15:
-                return 'background-color: #ff4b4b; color: white'
-            return ''
+        def style_metrics(df):
+            return df.style.format({
+                'str': '{:.2%}',
+                'doc': '{:.1f}'
+            }).background_gradient(subset=['doc'], cmap='RdYlGn'
+            ).background_gradient(subset=['str'], cmap='YlGn')
 
-        # Group by Master SKU for the view
-        view_df = merged[['master_sku', 'channel', 'inventory', 'doc']].sort_values('doc')
-        
-        st.dataframe(
-            view_df.style.applymap(color_risk, subset=['doc']),
-            use_container_width=True
-        )
+        st.dataframe(style_metrics(merged[['master_sku', 'channel', 'inventory', 'doc', 'str']]), use_container_width=True)
 else:
-    st.info("Please upload your channel files to begin.")
+    st.info("Awaiting file uploads.")
