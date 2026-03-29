@@ -15,6 +15,15 @@ except Exception:
 
 COMMON_SKU_FILE = "2026-03-28T16-00_export.csv"
 
+# --- HELPER: FILE LOADER ---
+def load_data(uploaded_file, skiprows=0):
+    """Helper to read both CSV and Excel files"""
+    if uploaded_file.name.endswith('.csv'):
+        return pd.read_csv(uploaded_file, skiprows=skiprows)
+    else:
+        # For Excel, skiprows works the same way
+        return pd.read_excel(uploaded_file, skiprows=skiprows)
+
 # --- DB FUNCTIONS ---
 def init_db():
     with engine.connect() as conn:
@@ -49,8 +58,10 @@ def parse_amazon(inv_df, sales_df=None):
     inv_df['channel_sku'] = inv_df['ASIN'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Sellable On Hand Units'], errors='coerce').fillna(0)
     inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
+    
     if sales_df is not None:
         sales_df['ASIN'] = sales_df['ASIN'].astype(str).str.strip()
+        # Amazon Sales DRR based on report period (standardized to 30 days)
         drr = sales_df.groupby('ASIN')['Ordered Units'].sum() / 30
         inv_df = inv_df.merge(drr, left_on='ASIN', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['Ordered Units'].replace(0, 0.001)
@@ -100,43 +111,44 @@ init_db()
 master_list = pd.read_csv(COMMON_SKU_FILE)['name'].unique().tolist()
 db_mappings = load_mapping_from_db()
 
-st.title("🛡️ Mama Nourish | Inventory Control Center")
+st.title("🛡️ Mama Nourish | Control Center")
 
-# --- STEP 1: UPLOAD ---
+# --- STEP 1: UPLOAD (CSV & EXCEL) ---
 st.subheader("📥 Upload Reports")
 c1, c2, c3, c4 = st.columns(4)
 uploaded_data = []
+file_types = ["csv", "xlsx", "xls"]
 
 with c1:
     st.info("**Amazon**")
-    amz_i = st.file_uploader("Amazon Inventory", type="csv")
-    amz_s = st.file_uploader("Amazon Sales (Custom)", type="csv")
+    amz_i = st.file_uploader("Amazon Inventory", type=file_types)
+    amz_s = st.file_uploader("Amazon Sales", type=file_types)
     if amz_i:
-        s_df = pd.read_csv(amz_s, skiprows=1) if amz_s else None
-        uploaded_data.append((parse_amazon(pd.read_csv(amz_i, skiprows=1), s_df), 'Amazon'))
+        s_df = load_data(amz_s, skiprows=1) if amz_s else None
+        uploaded_data.append((parse_amazon(load_data(amz_i, skiprows=1), s_df), 'Amazon'))
 
 with c2:
     st.info("**Blinkit**")
-    blk_i = st.file_uploader("Blinkit Inventory", type="csv")
-    blk_s = st.file_uploader("Blinkit Sales", type="csv")
+    blk_i = st.file_uploader("Blinkit Inventory", type=file_types)
+    blk_s = st.file_uploader("Blinkit Sales", type=file_types)
     if blk_i:
-        s_df = pd.read_csv(blk_s) if blk_s else None
-        uploaded_data.append((parse_blinkit(pd.read_csv(blk_i, skiprows=2), s_df), 'Blinkit'))
+        s_df = load_data(blk_s) if blk_s else None
+        uploaded_data.append((parse_blinkit(load_data(blk_i, skiprows=2), s_df), 'Blinkit'))
 
 with c3:
     st.info("**Swiggy**")
-    swg_i = st.file_uploader("Swiggy Inventory", type="csv")
-    swg_s = st.file_uploader("Swiggy Sales", type="csv")
+    swg_i = st.file_uploader("Swiggy Inventory", type=file_types)
+    swg_s = st.file_uploader("Swiggy Sales", type=file_types)
     if swg_i and swg_s:
-        uploaded_data.append((parse_swiggy(pd.read_csv(swg_i), pd.read_csv(swg_s)), 'Swiggy'))
+        uploaded_data.append((parse_swiggy(load_data(swg_i), load_data(swg_s)), 'Swiggy'))
 
 with c4:
     st.info("**Big Basket**")
-    bb_i = st.file_uploader("BB Inventory", type="csv")
-    bb_s = st.file_uploader("BB Sales", type="csv")
+    bb_i = st.file_uploader("BB Inventory", type=file_types)
+    bb_s = st.file_uploader("BB Sales", type=file_types)
     if bb_i:
-        s_df = pd.read_csv(bb_s) if bb_s else None
-        uploaded_data.append((parse_bigbasket(pd.read_csv(bb_i), s_df), 'Big Basket'))
+        s_df = load_data(bb_s) if bb_s else None
+        uploaded_data.append((parse_bigbasket(load_data(bb_i), s_df), 'Big Basket'))
 
 # --- STEP 2: PROCESSING & FILTERS ---
 if uploaded_data:
@@ -151,7 +163,7 @@ if uploaded_data:
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
-        st.warning(f"🚨 {len(unmapped)} New SKUs found. Link them once to save to Neon DB.")
+        st.warning(f"🚨 {len(unmapped)} New SKUs detected.")
         with st.form("mapping_form"):
             new_db_entries = []
             for _, row in unmapped.iterrows():
@@ -159,35 +171,30 @@ if uploaded_data:
                 choice = st.selectbox(f"Map {chan}: {c_sku}", ["Select..."] + master_list, key=f"{chan}_{c_sku}")
                 if choice != "Select...":
                     new_db_entries.append({"channel": chan, "channel_sku": c_sku, "master_sku": choice})
-            if st.form_submit_button("Permanent Save to Neon"):
+            if st.form_submit_button("Sync to Neon Cloud"):
                 if new_db_entries:
                     save_mapping_to_db(new_db_entries)
-                    st.success("Cloud Updated!")
+                    st.success("Database Updated!")
                     st.rerun()
     else:
-        # --- SIDEBAR FILTERS ---
+        # --- FILTERS ---
         st.sidebar.header("🔍 Filter View")
-        
-        # Channel Filter
         channels = ["All"] + sorted(merged['channel'].unique().tolist())
-        sel_channel = st.sidebar.selectbox("Select Channel", channels)
+        sel_channel = st.sidebar.selectbox("Channel", channels)
         
-        # Product Filter
         products = ["All"] + sorted(merged['master_sku'].unique().tolist())
-        sel_product = st.sidebar.selectbox("Select Product (Master SKU)", products)
+        sel_product = st.sidebar.selectbox("Product", products)
 
-        # Apply Filtering Logic
         filtered_df = merged.copy()
         if sel_channel != "All":
             filtered_df = filtered_df[filtered_df['channel'] == sel_channel]
         if sel_product != "All":
             filtered_df = filtered_df[filtered_df['master_sku'] == sel_product]
 
-        # --- STEP 3: FINAL DASHBOARD ---
+        # --- DASHBOARD ---
         st.divider()
-        st.subheader("📊 Consolidated Inventory Health")
+        st.subheader("📊 Global Inventory Health")
         
-        # Ensure consistent columns
         for col in ['doc', 'str']:
             if col not in filtered_df.columns: filtered_df[col] = 0
 
@@ -199,8 +206,6 @@ if uploaded_data:
             }).background_gradient(subset=['doc'], cmap='RdYlGn_r')
 
         display_cols = ['master_sku', 'channel', 'inventory', 'doc', 'str']
-        final_view = filtered_df[display_cols].sort_values('doc')
-        
-        st.dataframe(style_metrics(final_view), use_container_width=True)
+        st.dataframe(style_metrics(filtered_df[display_cols].sort_values('doc')), use_container_width=True)
 else:
-    st.info("Please upload channel files to view the dashboard.")
+    st.info("Upload CSV or Excel exports to begin.")
