@@ -213,22 +213,75 @@ def parse_swiggy(inv_df, sales_df=None):
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
+    import re
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SKU_Id'].astype(str).str.strip()
     inv_df['location'] = inv_df['DC'].astype(str).str.strip() if 'DC' in inv_df.columns else "Unknown"
     inv_df['inventory'] = pd.to_numeric(inv_df['Total SOH'], errors='coerce').fillna(0)
-    
-    sales_val = pd.Series(0, index=inv_df.index)
+
+    # BB inventory has SOH Day of Cover (HO) — pre-computed DOC, reliable fallback
+    doh_col = find_col(inv_df, ['SOH Day of Cover (HO)', 'SOH Day of Cover', 'Day of Cover'])
+    doh_fallback = pd.to_numeric(inv_df[doh_col], errors='coerce').fillna(0).clip(upper=365) \
+        if doh_col else pd.Series(0.0, index=inv_df.index)
+
+    # Map DC name -> BB sales source_city_name
+    # Strip '-DC' / '-DC2' / ' DC' suffix, then apply known city aliases
+    BB_DC_CITY_MAP = {
+        'Ahmedabad':    'Ahmedabad-Gandhinagar',
+        'Bhubaneswar':  'Bhubaneshwar-Cuttack',
+        'Kundli':       'Gurgaon',
+        'Lucknow':      'Lucknow-Kanpur',
+        'Vadodara':     'Ahmedabad-Gandhinagar',
+        'Vijayawada':   'Vijayawada-Guntur',
+    }
+    def dc_to_city(dc_name):
+        city = re.sub(r'[-\s]?DC\d*$', '', str(dc_name), flags=re.IGNORECASE).strip()
+        return BB_DC_CITY_MAP.get(city, city)
+
+    inv_df['_city_key'] = inv_df['location'].apply(dc_to_city)
+
+    n_days = 30  # default
+    has_sales = False
+    sales_val = pd.Series(0.0, index=inv_df.index)
+
     if sales_df is not None:
+        sales_df = sales_df.copy()
         s_sku = find_col(sales_df, ['source_sku_id', 'SKU_Id', 'SKU ID'])
-        if s_sku:
-            sales_df[s_sku] = sales_df[s_sku].astype(str).str.strip()
-            sales_grp = sales_df.groupby(s_sku)['total_quantity'].sum()
-            inv_df = inv_df.merge(sales_grp, left_on='channel_sku', right_index=True, how='left').fillna(0)
-            sales_val = inv_df['total_quantity']
-    
-    inv_df['str'] = sales_val / (sales_val + inv_df['inventory']).replace(0, 1)
-    inv_df['doc'] = inv_df['inventory'] / (sales_val / 30).replace(0, 0.001)
+        s_city = find_col(sales_df, ['source_city_name', 'city_name', 'DC', 'City'])
+
+        # BB sales encodes date range as a string field: '20260301 - 20260328'
+        date_range_col = find_col(sales_df, ['date_range', 'Date Range', 'daterange'])
+        if date_range_col:
+            try:
+                dr = sales_df[date_range_col].dropna().iloc[0]
+                parts = str(dr).split(' - ')
+                d1 = pd.to_datetime(parts[0].strip(), format='%Y%m%d')
+                d2 = pd.to_datetime(parts[1].strip(), format='%Y%m%d')
+                n_days = max((d2 - d1).days + 1, 1)
+            except Exception:
+                pass
+
+        if s_sku and s_city:
+            sales_df['c_sku'] = sales_df[s_sku].astype(str).str.strip()
+            sales_df['c_city'] = sales_df[s_city].astype(str).str.strip()
+            sales_grp = sales_df.groupby(['c_sku', 'c_city'])['total_quantity'].sum().reset_index()
+            inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', '_city_key'],
+                                  right_on=['c_sku', 'c_city'], how='left').fillna(0)
+            sales_val = pd.to_numeric(inv_df['total_quantity'], errors='coerce').fillna(0)
+            has_sales = True
+
+    if has_sales:
+        daily_rate = (sales_val / n_days).replace(0, 0.001)
+        sales_30d = sales_val * (30 / n_days)
+        inv_df['str'] = sales_30d / (sales_30d + inv_df['inventory']).replace(0, 1)
+        computed_doc = inv_df['inventory'] / daily_rate
+        # Where no sales matched, fall back to BB's own SOH Day of Cover
+        inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
+    else:
+        # No sales file: use BB's pre-computed SOH Day of Cover directly
+        inv_df['str'] = 0.0
+        inv_df['doc'] = doh_fallback.values
+
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 # --- MAIN APP ---
@@ -308,12 +361,15 @@ if uploaded_data:
 
         filtered_df = merged[(merged['channel'].isin(sel_channels)) & (merged['master_sku'].isin(sel_products))]
 
+        # Exclude zero-inventory rows — they have no meaningful DOC/STR and skew metrics
+        filtered_df = filtered_df[filtered_df['inventory'] > 0].copy()
+
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
         m1, m2, m3 = st.columns(3)
         m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
 
-        # Weighted avg DOC: exclude rows where doc is sentinel-inflated (zero sales)
+        # Weighted avg DOC: also exclude sentinel-inflated rows (no sales data, doc > 9999)
         valid_doc_data = filtered_df[(filtered_df['doc'] > 0) & (filtered_df['doc'] < 9999)]
         if not valid_doc_data.empty and valid_doc_data['inventory'].sum() > 0:
             weighted_doc = (valid_doc_data['doc'] * valid_doc_data['inventory']).sum() / valid_doc_data['inventory'].sum()
@@ -321,10 +377,9 @@ if uploaded_data:
         else:
             m2.metric("Avg Days of Cover", "N/A")
 
-        # Weighted avg STR: use all rows with inventory (STR=0 is valid for unsold SKUs)
-        str_data = filtered_df[filtered_df['inventory'] > 0]
-        if not str_data.empty:
-            weighted_str = (str_data['str'] * str_data['inventory']).sum() / str_data['inventory'].sum()
+        # Weighted avg STR across all rows with inventory (already filtered above)
+        if not filtered_df.empty:
+            weighted_str = (filtered_df['str'] * filtered_df['inventory']).sum() / filtered_df['inventory'].sum()
             m3.metric("Avg Sell-Through %", f"{weighted_str:.2%}")
         else:
             m3.metric("Avg Sell-Through %", "0.00%")
