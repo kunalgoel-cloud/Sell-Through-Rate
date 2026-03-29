@@ -398,6 +398,27 @@ if uploaded_data:
         sel_locations = st.sidebar.multiselect("Filter by Location", u_locations, default=u_locations)
         filtered_df = filtered_df[filtered_df['location'].isin(sel_locations)]
 
+        # --- ACTIONABLE FILTERS (Table-level only, do not affect top-line metrics) ---
+        st.sidebar.divider()
+        st.sidebar.header("🎯 Actionable Filters")
+        st.sidebar.caption("Filter the output table to focus on SKUs that need attention.")
+
+        min_doc = st.sidebar.slider(
+            "Min Days of Cover (DOC)",
+            min_value=0, max_value=180, value=0, step=1,
+            help="Show only rows where Days of Cover is ≥ this value"
+        )
+        max_doc = st.sidebar.slider(
+            "Max Days of Cover (DOC)",
+            min_value=0, max_value=500, value=500, step=1,
+            help="Show only rows where Days of Cover is ≤ this value"
+        )
+        min_str = st.sidebar.slider(
+            "Min Sell-Through Rate (%)",
+            min_value=0, max_value=100, value=0, step=1,
+            help="Show only rows where Sell-Through Rate is ≥ this value"
+        )
+
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
         m1, m2, m3, m4 = st.columns(4)
@@ -436,6 +457,30 @@ if uploaded_data:
 
         # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
+
+        # Apply actionable filters (DOC range + min STR) — table only, metrics unaffected
+        table_df = filtered_df.copy()
+        table_df = table_df[
+            (table_df['doc'] >= min_doc) &
+            (table_df['doc'] <= max_doc) &
+            (table_df['str'] >= min_str / 100)
+        ]
+
+        # Show filter summary
+        total_rows = len(filtered_df)
+        shown_rows = len(table_df)
+        if min_doc > 0 or max_doc < 500 or min_str > 0:
+            filter_parts = []
+            if min_doc > 0 or max_doc < 500:
+                filter_parts.append(f"DOC between **{min_doc}** – **{max_doc}** days")
+            if min_str > 0:
+                filter_parts.append(f"STR ≥ **{min_str}%**")
+            st.caption(
+                f"🎯 Showing **{shown_rows}** of {total_rows} rows — filtered by {', '.join(filter_parts)}"
+            )
+        else:
+            st.caption(f"Showing all **{total_rows}** rows. Use the Actionable Filters in the sidebar to narrow down.")
+
         def color_doc(val):
             if val < 7:
                 return 'color: red; font-weight: bold'
@@ -446,7 +491,7 @@ if uploaded_data:
 
         display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
         st.dataframe(
-            filtered_df[display_cols].sort_values('doc').style.format({
+            table_df[display_cols].sort_values('doc').style.format({
                 'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'
             }).applymap(color_doc, subset=['doc']),
             use_container_width=True
