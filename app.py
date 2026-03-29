@@ -292,8 +292,12 @@ if uploaded_data:
         # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
         def color_doc(val):
-            color = 'red' if val < 7 else 'orange' if val < 15 else 'white'
-            return f'color: {color}'
+            if val < 7:
+                return 'color: red; font-weight: bold'
+            elif val < 15:
+                return 'color: orange; font-weight: bold'
+            else:
+                return ''  # inherit default — 'white' was invisible on white background
 
         display_cols = ['master_sku', 'channel', 'location', 'inventory', 'doc', 'str']
         st.dataframe(
