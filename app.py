@@ -129,8 +129,14 @@ def parse_swiggy(inv_df, sales_df=None):
     # Normalise city for joining (sales file has CITY, not FacilityName)
     inv_df['_city_key'] = inv_df['City'].astype(str).str.strip().str.upper()
 
+    # DaysOnHand from inventory file = Swiggy's own pre-computed DOC; cap at 365 to remove outliers
+    doh_fallback = pd.to_numeric(inv_df['DaysOnHand'], errors='coerce').fillna(0).clip(upper=365) \
+        if 'DaysOnHand' in inv_df.columns else pd.Series(0.0, index=inv_df.index)
+
     sales_val = pd.Series(0.0, index=inv_df.index)
     n_days = 30  # default; overridden below when a date column is present
+    has_sales = False
+
     if sales_df is not None:
         sales_df = sales_df.copy()
         s_sku = find_col(sales_df, ['ITEM_CODE', 'ItemCode', 'SKU'])
@@ -149,12 +155,21 @@ def parse_swiggy(inv_df, sales_df=None):
             inv_df = inv_df.merge(sales_grp, left_on=['channel_sku', '_city_key'],
                                   right_on=['c_sku', 'c_city'], how='left').fillna(0)
             sales_val = inv_df['UNITS_SOLD']
+            has_sales = True
 
-    # Normalise raw sales to a 30-day equivalent for STR, keep daily rate for DOC
-    daily_rate = (sales_val / n_days).replace(0, 0.001)
-    sales_30d = sales_val * (30 / n_days)
-    inv_df['str'] = sales_30d / (sales_30d + inv_df['inventory']).replace(0, 1)
-    inv_df['doc'] = inv_df['inventory'] / daily_rate
+    if has_sales:
+        # Sales file uploaded: compute DOC & STR from actual sales, normalised to day span
+        daily_rate = (sales_val / n_days).replace(0, 0.001)
+        sales_30d = sales_val * (30 / n_days)
+        inv_df['str'] = sales_30d / (sales_30d + inv_df['inventory']).replace(0, 1)
+        # For locations with zero sales in the window, fall back to DaysOnHand
+        computed_doc = inv_df['inventory'] / daily_rate
+        inv_df['doc'] = computed_doc.where(sales_val > 0, doh_fallback.values)
+    else:
+        # No sales file: use Swiggy's own DaysOnHand as DOC, STR unavailable
+        inv_df['doc'] = doh_fallback.values
+        inv_df['str'] = 0.0
+
     return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
