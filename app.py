@@ -383,7 +383,7 @@ if uploaded_data:
 
         # --- 4. TOP LINE METRICS (WEIGHTED AVERAGES) ---
         st.divider()
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Inventory", f"{filtered_df['inventory'].sum():,.0f} units")
 
         # Weighted avg DOC: also exclude sentinel-inflated rows (no sales data, doc > 9999)
@@ -400,6 +400,14 @@ if uploaded_data:
             m3.metric("Avg Sell-Through %", f"{weighted_str:.2%}")
         else:
             m3.metric("Avg Sell-Through %", "0.00%")
+
+        # Weighted avg DRR (units/day), weighted by inventory
+        valid_drr_data = filtered_df[filtered_df['drr'] > 0]
+        if not valid_drr_data.empty and valid_drr_data['inventory'].sum() > 0:
+            weighted_drr = (valid_drr_data['drr'] * valid_drr_data['inventory']).sum() / valid_drr_data['inventory'].sum()
+            m4.metric("Avg DRR", f"{weighted_drr:.2f} units/day")
+        else:
+            m4.metric("Avg DRR", "N/A")
 
         # --- 5. DASHBOARD TABLE ---
         st.subheader("📊 Inventory Performance by Location")
