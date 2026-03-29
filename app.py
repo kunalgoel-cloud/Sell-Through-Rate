@@ -50,29 +50,32 @@ def save_mapping_to_db(new_entries):
             """), entry)
         conn.commit()
 
-# --- CHANNEL PARSERS (WITH TYPE SAFETY) ---
+# --- CHANNEL PARSERS (WITH LOCATION SUPPORT) ---
 
 def parse_amazon(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['ASIN'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Sellable On Hand Units'], errors='coerce').fillna(0)
     inv_df['str'] = pd.to_numeric(inv_df['Sell-Through %'].astype(str).str.replace('%',''), errors='coerce').fillna(0) / 100
+    inv_df['location'] = "National" # Amazon reporting is aggregate
     
     if sales_df is not None:
         sales_df['ASIN'] = sales_df['ASIN'].astype(str).str.strip()
         drr = sales_df.groupby('ASIN')['Ordered Units'].sum() / 30
-        # Ensure index of drr is string to match inv_df['channel_sku']
         drr.index = drr.index.astype(str)
         inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left')
         inv_df['doc'] = inv_df['inventory'] / inv_df['Ordered Units'].replace(0, 0.001)
     else:
         inv_df['doc'] = 0
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'location']]
 
 def parse_blinkit(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['Item ID'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Total sellable'], errors='coerce').fillna(0)
+    # Blinkit uses Facility Name for location
+    inv_df['location'] = inv_df['Warehouse Facility Name'] if 'Warehouse Facility Name' in inv_df.columns else ""
+    
     if sales_df is not None:
         sales_df['Item Id'] = sales_df['Item Id'].astype(str).str.strip()
         drr = sales_df.groupby('Item Id')['Quantity'].sum() / 30
@@ -82,29 +85,30 @@ def parse_blinkit(inv_df, sales_df=None):
     else:
         drr_col = pd.to_numeric(inv_df['Last 30 days'], errors='coerce').fillna(0) / 30
         inv_df['doc'] = inv_df['inventory'] / drr_col.replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
 
 def parse_swiggy(inv_df, sales_df):
-    # Fix for the ValueError: Force both to String
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SkuCode'].astype(str).str.strip()
+    # Swiggy location: City + Facility
+    inv_df['location'] = inv_df['City'] + " (" + inv_df['FacilityName'] + ")"
     
     sales_df = sales_df.copy()
     sales_df['ITEM_CODE'] = sales_df['ITEM_CODE'].astype(str).str.strip()
-    
     drr = sales_df.groupby('ITEM_CODE')['UNITS_SOLD'].sum() / 30
-    drr.index = drr.index.astype(str) # Force index to string
+    drr.index = drr.index.astype(str)
     
-    # Merge on the cleaned string columns
     inv_df = inv_df.merge(drr, left_on='channel_sku', right_index=True, how='left').fillna(0)
     inv_df['inventory'] = inv_df['WarehouseQtyAvailable']
     inv_df['doc'] = inv_df['inventory'] / inv_df['UNITS_SOLD'].replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
     inv_df = inv_df.copy()
     inv_df['channel_sku'] = inv_df['SKU_Id'].astype(str).str.strip()
     inv_df['inventory'] = pd.to_numeric(inv_df['Total SOH'], errors='coerce').fillna(0)
+    inv_df['location'] = inv_df['DC'] if 'DC' in inv_df.columns else ""
+    
     if sales_df is not None:
         sales_df['source_sku_id'] = sales_df['source_sku_id'].astype(str).str.strip()
         drr = sales_df.groupby('source_sku_id')['total_quantity'].sum() / 30
@@ -113,7 +117,7 @@ def parse_bigbasket(inv_df, sales_df=None):
         inv_df['doc'] = inv_df['inventory'] / inv_df['total_quantity'].replace(0, 0.001)
     else:
         inv_df['doc'] = pd.to_numeric(inv_df['SOH Day of Cover (HO)'], errors='coerce').fillna(0)
-    return inv_df[['channel_sku', 'inventory', 'doc']]
+    return inv_df[['channel_sku', 'inventory', 'doc', 'location']]
 
 # --- MAIN APP ---
 init_db()
@@ -167,11 +171,11 @@ if uploaded_data:
         all_dfs.append(df)
     
     combined = pd.concat(all_dfs, ignore_index=True)
-    # Ensure join keys are strings for Neon DB merge too
-    db_mappings['channel_sku'] = db_mappings['channel_sku'].astype(str)
     combined['channel_sku'] = combined['channel_sku'].astype(str)
+    db_mappings['channel_sku'] = db_mappings['channel_sku'].astype(str)
     
     merged = combined.merge(db_mappings, on=['channel', 'channel_sku'], how='left')
+    
     unmapped = merged[merged['master_sku'].isna()][['channel', 'channel_sku']].drop_duplicates()
     
     if not unmapped.empty:
@@ -186,7 +190,6 @@ if uploaded_data:
             if st.form_submit_button("Sync to Neon Cloud"):
                 if new_db_entries:
                     save_mapping_to_db(new_db_entries)
-                    st.success("Database Updated!")
                     st.rerun()
     else:
         # --- FILTERS ---
@@ -203,12 +206,23 @@ if uploaded_data:
         if sel_product != "All":
             filtered_df = filtered_df[filtered_df['master_sku'] == sel_product]
 
-        # --- DASHBOARD ---
+        # --- TOP LINE METRICS ---
         st.divider()
-        st.subheader("📊 Global Inventory Health")
+        m1, m2, m3 = st.columns(3)
+        total_inv = filtered_df['inventory'].sum()
+        # Filter out 0 for averages to avoid skewing
+        avg_doc = filtered_df[filtered_df['doc'] > 0]['doc'].mean() if not filtered_df.empty else 0
+        avg_str = filtered_df[filtered_df['str'] > 0]['str'].mean() if 'str' in filtered_df.columns else 0
+
+        m1.metric("Total Inventory", f"{total_inv:,.0f} units")
+        m2.metric("Avg Days of Cover", f"{avg_doc:.1f} days")
+        m3.metric("Avg Sell-Through %", f"{avg_str:.2%}")
+
+        # --- DASHBOARD ---
+        st.subheader("📊 Detailed Inventory Health")
         
-        for col in ['doc', 'str']:
-            if col not in filtered_df.columns: filtered_df[col] = 0
+        for col in ['doc', 'str', 'location']:
+            if col not in filtered_df.columns: filtered_df[col] = 0 if col != 'location' else ""
 
         def style_metrics(df):
             return df.style.format({
@@ -217,7 +231,7 @@ if uploaded_data:
                 'doc': '{:.1f} days'
             }).background_gradient(subset=['doc'], cmap='RdYlGn_r')
 
-        display_cols = ['master_sku', 'channel', 'inventory', 'doc', 'str']
+        display_cols = ['master_sku', 'channel', 'location', 'inventory', 'doc', 'str']
         st.dataframe(style_metrics(filtered_df[display_cols].sort_values('doc')), use_container_width=True)
 else:
     st.info("Upload CSV or Excel exports to begin.")
