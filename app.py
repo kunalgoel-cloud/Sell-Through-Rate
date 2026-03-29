@@ -94,7 +94,9 @@ def parse_amazon(inv_df, sales_df=None, sales_filename=None):
     # DOC uses actual day span; STR stays as Amazon-reported value (more accurate than recomputing)
     inv_df['drr'] = (sales_val / n_days).round(2)
     inv_df['doc'] = inv_df['inventory'] / inv_df['drr'].replace(0, 0.001)
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
+    inv_df['units_sold'] = sales_val
+    inv_df['n_days'] = n_days
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'units_sold', 'n_days', 'location']]
 
 def parse_blinkit(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -155,6 +157,8 @@ def parse_blinkit(inv_df, sales_df=None):
         # Only back-compute when last30 > 0 — last30=0 means no data, so DRR is unknown (0)
         fallback_drr = (last30 / 30).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
+        inv_df['units_sold'] = sales_val
+        inv_df['n_days'] = n_days
     else:
         # No sales file: use Last 30 days column from inventory report directly
         last30 = pd.to_numeric(inv_df.get('Last 30 days', pd.Series(0, index=inv_df.index)),
@@ -162,8 +166,10 @@ def parse_blinkit(inv_df, sales_df=None):
         inv_df['str'] = last30 / (last30 + inv_df['inventory']).replace(0, 1)
         inv_df['doc'] = inv_df['inventory'] / (last30 / 30).replace(0, 0.001)
         inv_df['drr'] = (last30 / 30).round(2)
+        inv_df['units_sold'] = last30
+        inv_df['n_days'] = 30
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'units_sold', 'n_days', 'location']]
 
 def parse_swiggy(inv_df, sales_df=None):
     inv_df = inv_df.copy()
@@ -214,13 +220,17 @@ def parse_swiggy(inv_df, sales_df=None):
         # Only back-compute when doh > 0 — doh=0 means no data, so DRR is unknown (0)
         fallback_drr = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
+        inv_df['units_sold'] = sales_val
+        inv_df['n_days'] = n_days
     else:
         # No sales file: use Swiggy's own DaysOnHand as DOC, STR unavailable
         inv_df['doc'] = doh_fallback.values
         inv_df['str'] = 0.0
         inv_df['drr'] = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
+        inv_df['units_sold'] = 0.0
+        inv_df['n_days'] = 30
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'units_sold', 'n_days', 'location']]
 
 def parse_bigbasket(inv_df, sales_df=None):
     import re
@@ -291,13 +301,17 @@ def parse_bigbasket(inv_df, sales_df=None):
         # Only back-compute when doh > 0 — doh=0 means no data, so DRR is unknown (0)
         fallback_drr = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
         inv_df['drr'] = (sales_val / n_days).where(sales_val > 0, fallback_drr).round(2)
+        inv_df['units_sold'] = sales_val
+        inv_df['n_days'] = n_days
     else:
         # No sales file: use BB's pre-computed SOH Day of Cover directly
         inv_df['str'] = 0.0
         inv_df['doc'] = doh_fallback.values
         inv_df['drr'] = (inv_df['inventory'] / doh_fallback.where(doh_fallback > 0, other=float('nan'))).fillna(0).round(2)
+        inv_df['units_sold'] = 0.0
+        inv_df['n_days'] = 30
 
-    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'location']]
+    return inv_df[['channel_sku', 'inventory', 'str', 'doc', 'drr', 'units_sold', 'n_days', 'location']]
 
 # --- MAIN APP ---
 init_db()
@@ -404,11 +418,19 @@ if uploaded_data:
         else:
             m3.metric("Avg Sell-Through %", "0.00%")
 
-        # Weighted avg DRR (units/day), weighted by inventory
-        valid_drr_data = filtered_df[filtered_df['drr'] > 0]
-        if not valid_drr_data.empty and valid_drr_data['inventory'].sum() > 0:
-            weighted_drr = (valid_drr_data['drr'] * valid_drr_data['inventory']).sum() / valid_drr_data['inventory'].sum()
-            m4.metric("Avg DRR", f"{weighted_drr:.2f} units/day")
+        # Avg DRR = total units sold across period / n_days
+        # Each channel may have a different n_days, so compute per-channel then sum
+        if not filtered_df.empty and filtered_df['units_sold'].sum() > 0:
+            total_units = 0
+            total_days = 0
+            for ch, grp in filtered_df.groupby('channel'):
+                ch_units = grp['units_sold'].sum()
+                ch_days = grp['n_days'].max()  # same n_days for all rows in a channel
+                if ch_days > 0:
+                    total_units += ch_units
+                    total_days = max(total_days, ch_days)  # use longest period as denominator
+            avg_drr = total_units / total_days if total_days > 0 else 0
+            m4.metric("Avg DRR", f"{avg_drr:.2f} units/day")
         else:
             m4.metric("Avg DRR", "N/A")
 
