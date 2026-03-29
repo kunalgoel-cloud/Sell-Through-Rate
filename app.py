@@ -505,7 +505,7 @@ if uploaded_data:
             else:
                 return ''
 
-        display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
+        display_cols = ['master_sku', 'channel_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
 
         if group_by == "None":
             render_df = table_df[display_cols].sort_values('inventory', ascending=False)
@@ -586,7 +586,7 @@ if uploaded_data:
         ]
         t1, t2, t3, t4 = st.tabs(tab_labels)
 
-        quad_display_cols = ['master_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
+        quad_display_cols = ['master_sku', 'channel_sku', 'channel', 'location', 'inventory', 'drr', 'doc', 'str']
         quad_fmt = {'str': '{:.2%}', 'doc': '{:.1f}', 'inventory': '{:,.0f}', 'drr': '{:.2f}'}
 
         def download_csv(df, cols, label, filename):
